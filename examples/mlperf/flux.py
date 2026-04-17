@@ -68,7 +68,8 @@ def flux_eval_step_interval(global_batch_size:int) -> int:
   return math.ceil(FLUX_EVAL_FREQUENCY_SAMPLES / global_batch_size)
 
 
-def flux_validation_target_met(validation_loss:float, target:float=FLUX_QUALITY_TARGET) -> bool:
+def flux_validation_target_met(validation_loss:float|Tensor, target:float=FLUX_QUALITY_TARGET) -> bool:
+  if isinstance(validation_loss, Tensor): validation_loss = float(validation_loss.item())
   return validation_loss <= target
 
 
@@ -83,9 +84,28 @@ def flux_sample_training_timesteps(batch_size:int, device=None, dtype=dtypes.flo
   return timestep_noise.cast(dtype).sigmoid()
 
 
-def flux_eval_timesteps(timestep_ids:Tensor|int|list[int]|tuple[int, ...], device=None, dtype=dtypes.float32) -> Tensor:
-  if not isinstance(timestep_ids, Tensor): timestep_ids = Tensor(timestep_ids, device=device, dtype=dtypes.int32)
-  return timestep_ids.cast(dtype) / FLUX_EVAL_TIMESTEP_DIVISOR
+def flux_eval_timestep_ids(timestep_ids:Tensor|int|float|list[int]|list[float]|tuple[int, ...]|tuple[float, ...], device=None) -> Tensor:
+  values = timestep_ids.numpy().reshape(-1).tolist() if isinstance(timestep_ids, Tensor) else timestep_ids
+  if isinstance(values, (int, float)): values = [values]
+  else: values = list(values)
+
+  bucket_ids = []
+  for value in values:
+    if isinstance(value, int):
+      bucket_id = value
+    else:
+      bucket_id = round(float(value) * FLUX_EVAL_TIMESTEP_DIVISOR)
+      if not math.isclose(bucket_id / FLUX_EVAL_TIMESTEP_DIVISOR, float(value), abs_tol=1e-6):
+        raise ValueError(f"eval timestep {value} does not align to MLPerf buckets")
+    if not 0 <= bucket_id < FLUX_EVAL_TIMESTEP_BUCKETS:
+      raise ValueError(f"eval timestep bucket {bucket_id} out of range")
+    bucket_ids.append(bucket_id)
+  return Tensor(bucket_ids, device=device, dtype=dtypes.int32)
+
+
+def flux_eval_timesteps(timestep_ids:Tensor|int|float|list[int]|list[float]|tuple[int, ...]|tuple[float, ...], device=None,
+                        dtype=dtypes.float32) -> Tensor:
+  return flux_eval_timestep_ids(timestep_ids, device=device).cast(dtype) / FLUX_EVAL_TIMESTEP_DIVISOR
 
 
 def flux_pack_latents(latents:Tensor) -> Tensor:
@@ -143,17 +163,17 @@ def flux_train_loss(model, mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, g
   return flux_rectified_flow_losses(model, latents, txt, vec, timesteps, guidance=guidance, flow_noise=flow_noise).mean()
 
 
-def flux_validation_losses(model, mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor|int|list[int]|tuple[int, ...],
+def flux_validation_losses(model, mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor,
+                           timestep_ids:Tensor|int|float|list[int]|list[float]|tuple[int, ...]|tuple[float, ...],
                            guidance:Tensor|None=None, latent_noise:Tensor|None=None, flow_noise:Tensor|None=None) -> Tensor:
   latents = flux_sample_latents(mean, logvar, latent_noise=latent_noise)
   timesteps = flux_eval_timesteps(timestep_ids, device=latents.device)
   return flux_rectified_flow_losses(model, latents, txt, vec, timesteps, guidance=guidance, flow_noise=flow_noise)
 
 
-def flux_aggregate_validation_loss(losses:Tensor, timestep_ids:Tensor|int|list[int]|tuple[int, ...]) -> Tensor:
+def flux_aggregate_validation_loss(losses:Tensor, timestep_ids:Tensor|int|float|list[int]|list[float]|tuple[int, ...]|tuple[float, ...]) -> Tensor:
   losses = losses.reshape(-1).cast(dtypes.float32)
-  if not isinstance(timestep_ids, Tensor): timestep_ids = Tensor(timestep_ids, device=losses.device, dtype=dtypes.int32)
-  timestep_ids = timestep_ids.reshape(-1).cast(dtypes.int32)
+  timestep_ids = flux_eval_timestep_ids(timestep_ids, device=losses.device)
   bucket_ids = Tensor.arange(FLUX_EVAL_TIMESTEP_BUCKETS, device=timestep_ids.device, dtype=dtypes.int32).reshape(FLUX_EVAL_TIMESTEP_BUCKETS, 1)
   matches = (bucket_ids == timestep_ids.reshape(1, -1)).cast(dtypes.float32)
   count_per_bucket = matches.sum(axis=1)
@@ -162,7 +182,8 @@ def flux_aggregate_validation_loss(losses:Tensor, timestep_ids:Tensor|int|list[i
   return (mean_per_bucket * present).sum() / present.sum()
 
 
-def flux_validation_loss(model, mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor|int|list[int]|tuple[int, ...],
+def flux_validation_loss(model, mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor,
+                         timestep_ids:Tensor|int|float|list[int]|list[float]|tuple[int, ...]|tuple[float, ...],
                          guidance:Tensor|None=None, latent_noise:Tensor|None=None, flow_noise:Tensor|None=None) -> Tensor:
   losses = flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids, guidance=guidance,
                                   latent_noise=latent_noise, flow_noise=flow_noise)
@@ -179,7 +200,7 @@ __all__ = [
   "FLUX_PACKED_SPATIAL_SIZE", "FLUX_PATCH_SIZE", "FLUX_AUTOENCODER_SCALE", "FLUX_AUTOENCODER_SHIFT",
   "FLUX_QUALITY_TARGET", "FLUX_SINGLE_STREAM_BLOCKS", "FLUX_T5_EMBED_DIM", "FLUX_T5_MAX_TOKENS",
   "FLUX_TRAIN_SAMPLES", "FLUX_VAE_DOWNSCALE_FACTOR", "flux_aggregate_validation_loss",
-  "flux_checkpoint_step_interval", "flux_eval_step_interval", "flux_eval_timesteps",
+  "flux_checkpoint_step_interval", "flux_eval_step_interval", "flux_eval_timestep_ids", "flux_eval_timesteps",
   "flux_image_ids", "flux_pack_latents", "flux_rectified_flow_inputs", "flux_rectified_flow_losses", "flux_sample_latents",
   "flux_sample_training_timesteps", "flux_train_loss", "flux_validation_loss",
   "flux_validation_losses", "flux_validation_target_met", "flux_text_ids",
