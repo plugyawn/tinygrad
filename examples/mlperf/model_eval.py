@@ -247,6 +247,84 @@ def eval_llama3():
   log_perplexity = np.mean(losses)
   print(f"Log Perplexity: {log_perplexity}")
 
+def eval_flux():
+  import re, sys
+  from tinygrad.helpers import tqdm
+  from extra.models.flux import Flux, FluxParams
+  from examples.mlperf.dataloader import batch_load_val_flux_preprocessed
+  from examples.mlperf.flux import FLUX_MLPERF_MODEL_CONFIG, FLUX_QUALITY_TARGET, flux_aggregate_validation_loss, flux_validation_losses, flux_validation_target_met
+  from examples.mlperf.initializers import init_flux
+
+  config = {}
+  GPUS               = config["GPUS"]                   = [f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1))]
+  for x in GPUS: Device[x]
+  print(f"running flux eval on {GPUS}")
+  seed               = config["seed"]                   = getenv("SEED", 12345)
+  BS                 = config["BS"]                     = getenv("BS", 1 * len(GPUS))
+  DATADIR            = config["DATADIR"]                = Path(getenv("DATADIR", "./datasets/flux"))
+  VAL_DATASET        = config["VAL_DATASET"]            = getenv("VAL_DATASET", str(DATADIR / "val-*"))
+  EVAL_CKPT_DIR      = config["EVAL_CKPT_DIR"]          = getenv("EVAL_CKPT_DIR", "")
+  STOP_IF_CONVERGED  = config["STOP_IF_CONVERGED"]      = getenv("STOP_IF_CONVERGED", 0)
+
+  if (WANDB := getenv("WANDB", "")):
+    import wandb
+    wandb.init(config=config, project="MLPerf-Flux")
+
+  assert EVAL_CKPT_DIR != "", "provide a directory with checkpoints to be evaluated"
+  print(f"running eval on checkpoints in {EVAL_CKPT_DIR}\nSEED={seed}")
+  eval_queue:list[tuple[int, Path]] = []
+  for p in Path(EVAL_CKPT_DIR).iterdir():
+    if p.name.endswith(".safetensors"):
+      match = re.fullmatch(r"(?:flux_step)?(\d+)", p.stem)
+      assert match is not None, f"invalid checkpoint name: {p.name}, expected <digits>.safetensors or flux_step<digits>.safetensors"
+      eval_queue.append((int(match.group(1)), p))
+  assert len(eval_queue), f'no files ending with ".safetensors" were found in {EVAL_CKPT_DIR}'
+  print(sorted(eval_queue, reverse=True))
+
+  Tensor.manual_seed(seed)
+  model = init_flux(Flux(FluxParams(**FLUX_MLPERF_MODEL_CONFIG)), None, GPUS, strict=True)
+
+  @TinyJit
+  def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor, latent_noise:Tensor, flow_noise:Tensor) -> Tensor:
+    for t in (mean, logvar, txt, vec, timestep_ids, latent_noise, flow_noise): t.shard_(GPUS, axis=0)
+    return flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids,
+                                  latent_noise=latent_noise, flow_noise=flow_noise).to("CPU").realize()
+
+  @Tensor.train(mode=False)
+  def eval_model() -> float:
+    losses, timestep_ids = [], []
+    for batch in tqdm(batch_load_val_flux_preprocessed(VAL_DATASET, BS)):
+      assert "timestep" in batch, "Flux eval expects preprocessed validation samples with timestep bucket ids"
+      mean, logvar = batch["mean"], batch["logvar"]
+      batch_timestep_ids = batch["timestep"].numpy()
+      losses.append(eval_step(mean, logvar, batch["t5_encodings"], batch["clip_encodings"], batch["timestep"],
+                              Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype), Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype)).numpy())
+      timestep_ids.append(batch_timestep_ids)
+    assert losses, f"no validation samples were loaded from {VAL_DATASET}"
+    validation_loss = flux_aggregate_validation_loss(Tensor(np.concatenate(losses), dtype=dtypes.float32, device="CPU"),
+                                                     Tensor(np.concatenate(timestep_ids), dtype=dtypes.int32, device="CPU")).item()
+    return float(validation_loss)
+
+  def flux_eval_state_dict(ckpt_path:Path) -> dict[str, Tensor]:
+    state_dict = safe_load(ckpt_path)
+    if any(k.startswith("model.") for k in state_dict): state_dict = {k.removeprefix("model."):v for k,v in state_dict.items() if k.startswith("model.")}
+    assert state_dict, f"no Flux model weights found in {ckpt_path}"
+    return state_dict
+
+  for ckpt_iteration, p in sorted(eval_queue, reverse=True):
+    Tensor.manual_seed(seed)
+    load_state_dict(model, flux_eval_state_dict(p), strict=True)
+    validation_loss = eval_model()
+    converged = flux_validation_target_met(validation_loss)
+    print(f"eval results for {EVAL_CKPT_DIR}/{p.name}: validation_loss={validation_loss}, target={FLUX_QUALITY_TARGET}, converged={converged}")
+    if WANDB:
+      wandb.log({"eval/ckpt_iteration": ckpt_iteration, "eval/validation_loss": validation_loss})
+    if converged and STOP_IF_CONVERGED:
+      print(f"Convergence detected, exiting early before evaluating other checkpoints due to STOP_IF_CONVERGED={STOP_IF_CONVERGED}")
+      sys.exit()
+
+  return validation_loss, ckpt_iteration
+
 # NOTE: BEAM hangs on 8xmi300x with DECODE_BS=384 in final realize below; function is declared here for external testing
 @TinyJit
 def vae_decode(x:Tensor, vae, disable_beam=False) -> Tensor:
