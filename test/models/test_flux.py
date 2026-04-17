@@ -8,6 +8,7 @@ import numpy as np
 from tinygrad import Tensor
 from tinygrad.nn.state import get_state_dict
 from extra.models.flux import Flux, FluxParams
+from examples.mlperf.flux import FLUX_FIXED_EVAL_TIMESTEPS, flux_aggregate_validation_loss, flux_eval_timesteps, flux_validation_target_met
 
 try:
   import torch
@@ -294,6 +295,23 @@ def set_equal_weights(model, torch_model):
 
 
 class TestFlux(unittest.TestCase):
+  def test_flux_eval_timesteps_accept_fixed_eval_constants(self):
+    timesteps = flux_eval_timesteps(FLUX_FIXED_EVAL_TIMESTEPS)
+    np.testing.assert_allclose(timesteps.numpy(), FLUX_FIXED_EVAL_TIMESTEPS, atol=0.0, rtol=0.0)
+
+  def test_flux_eval_timesteps_accept_scalar_bucket_id(self):
+    timesteps = flux_eval_timesteps(3)
+    self.assertEqual(timesteps.shape, (1,))
+    np.testing.assert_allclose(timesteps.numpy(), [3 / 8], atol=0.0, rtol=0.0)
+
+  def test_flux_aggregate_validation_loss_rejects_invalid_buckets(self):
+    with self.assertRaisesRegex(ValueError, "out of range"):
+      flux_aggregate_validation_loss(Tensor([1.0]), [-1])
+
+  def test_flux_validation_target_met_accepts_tensor(self):
+    self.assertTrue(flux_validation_target_met(Tensor([0.5]).reshape(()), target=0.6))
+    self.assertFalse(flux_validation_target_met(Tensor([0.7]).reshape(()), target=0.6))
+
   def test_flux_rejects_odd_rope_axes(self):
     with self.assertRaisesRegex(ValueError, "RoPE axes must be even"):
       Flux(FluxParams(
