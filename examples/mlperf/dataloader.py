@@ -1,4 +1,4 @@
-import os, random, pickle, queue, struct, math, functools, hashlib, time
+import os, random, pickle, queue, struct, math, functools, hashlib, time, glob, io
 from typing import List
 from pathlib import Path
 from multiprocessing import Queue, Process, shared_memory, connection, Lock, cpu_count
@@ -529,6 +529,81 @@ def batch_load_train_stable_diffusion(urls:str, BS:int):
     assert all(isinstance(moment_mean_logvar, np.ndarray) and moment_mean_logvar.shape==(1,8,64,64) for moment_mean_logvar in x["npy"])
     assert all(isinstance(caption, str) for caption in x["txt"])
     yield x
+
+# Reference (dataset contract): https://github.com/mlcommons/training/tree/master/text_to_image
+# Reference (preprocessing schema): https://raw.githubusercontent.com/pytorch/torchtitan/9603aa83f0e0c69b5d66f9fab61b1f28e9013a2f/torchtitan/experiments/flux/scripts/preprocess_flux_dataset.py
+def _is_flux_preprocessed_dataset_dir(path:Path) -> bool:
+  return path.is_dir() and (path / "state.json").exists()
+
+def _resolve_flux_preprocessed_dataset_paths(dataset_path:str|Path) -> list[Path]:
+  path_str = str(dataset_path)
+  for suffix in ("/*", "*"):
+    if path_str.endswith(suffix) and _is_flux_preprocessed_dataset_dir(root:=Path(path_str.removesuffix(suffix))):
+      return [root]
+  if _is_flux_preprocessed_dataset_dir(path:=Path(path_str)): return [path]
+
+  resolved, seen = [], set()
+  for match in sorted(Path(p) for p in glob.glob(path_str)):
+    candidates = [match] if _is_flux_preprocessed_dataset_dir(match) else []
+    if _is_flux_preprocessed_dataset_dir(match.parent): candidates.append(match.parent)
+    if match.is_dir(): candidates.extend(sorted(child for child in match.iterdir() if _is_flux_preprocessed_dataset_dir(child)))
+    for candidate in candidates:
+      if candidate not in seen:
+        seen.add(candidate)
+        resolved.append(candidate)
+  if not resolved: raise FileNotFoundError(f"can't find Flux preprocessed dataset at {dataset_path}")
+  return resolved
+
+def _deserialize_flux_preprocessed_bf16_array(data:bytes) -> np.ndarray:
+  return np.load(io.BytesIO(data), allow_pickle=False)
+
+def _stack_flux_preprocessed_bf16(batch:list[dict], key:str) -> Tensor:
+  return Tensor(np.stack([_deserialize_flux_preprocessed_bf16_array(sample[key]) for sample in batch]),
+                dtype=dtypes.uint16, device="CPU").bitcast(dtypes.bfloat16)
+
+def _collate_flux_preprocessed_batch(batch:list[dict]) -> dict[str, Tensor|list[str]]:
+  required_keys = ("__key__", "t5_encodings", "clip_encodings", "mean", "logvar")
+  assert all(all(key in sample for key in required_keys) for sample in batch)
+  assert all(isinstance(sample["__key__"], str) for sample in batch)
+  assert all(isinstance(sample[key], (bytes, bytearray)) for sample in batch for key in required_keys[1:])
+  ret:dict[str, Tensor|list[str]] = {
+    "__key__": [sample["__key__"] for sample in batch],
+    "t5_encodings": _stack_flux_preprocessed_bf16(batch, "t5_encodings"),
+    "clip_encodings": _stack_flux_preprocessed_bf16(batch, "clip_encodings"),
+    "mean": _stack_flux_preprocessed_bf16(batch, "mean"),
+    "logvar": _stack_flux_preprocessed_bf16(batch, "logvar"),
+  }
+  if "timestep" in batch[0]:
+    assert all("timestep" in sample for sample in batch)
+    ret["timestep"] = Tensor([sample["timestep"] for sample in batch], dtype=dtypes.int32, device="CPU")
+  return ret
+
+def batch_load_flux_preprocessed(dataset_path:str|Path, BS:int):
+  from datasets import load_from_disk
+
+  batch = []
+  for path in _resolve_flux_preprocessed_dataset_paths(dataset_path):
+    for sample in load_from_disk(str(path)):
+      batch.append(sample)
+      if len(batch) == BS:
+        yield _collate_flux_preprocessed_batch(batch)
+        batch = []
+  if batch: yield _collate_flux_preprocessed_batch(batch)
+
+def batch_load_train_flux_preprocessed(dataset_path:str|Path, BS:int):
+  yield from batch_load_flux_preprocessed(dataset_path, BS)
+
+def batch_load_val_flux_preprocessed(dataset_path:str|Path, BS:int):
+  yield from batch_load_flux_preprocessed(dataset_path, BS)
+
+def load_flux_empty_encodings(empty_encodings_path:str|Path) -> dict[str, Tensor]:
+  empty_encodings_path = Path(empty_encodings_path)
+  return {
+    "t5_encodings": Tensor(np.load(empty_encodings_path / "t5_empty.npy", allow_pickle=False),
+                           dtype=dtypes.float16, device="CPU"),
+    "clip_encodings": Tensor(np.load(empty_encodings_path / "clip_empty.npy", allow_pickle=False),
+                             dtype=dtypes.float16, device="CPU"),
+  }
 
 # llama3
 
