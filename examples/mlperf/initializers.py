@@ -187,3 +187,19 @@ def init_stable_diffusion(version:str, pretrained:str, devices:list[str]):
       Tensor.realize(*to_move)
 
   return model, unet, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod
+
+def init_flux(model, pretrained:str|None, devices:list[str], strict:bool=False):
+  from tinygrad.nn.state import get_state_dict, load_state_dict, safe_load
+  if pretrained is not None: load_state_dict(model, safe_load(str(pretrained)), strict=strict)
+
+  to_move = list(get_state_dict(model).values())
+  if len(devices) > 1:
+    for t in to_move: t.to_(devices)
+    with Context(BEAM=0):
+      Tensor.realize(*to_move)
+  else:
+    for t in to_move:
+      if len(devices) == 1: t.to_(devices[0])
+    Tensor.realize(*to_move)
+
+  return model
