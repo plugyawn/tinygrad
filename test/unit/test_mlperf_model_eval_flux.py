@@ -20,6 +20,45 @@ class _FakeDevice:
   def __getitem__(self, key): return key
 
 
+class _FakeMLLogger:
+  def __init__(self):
+    self.calls = []
+    self.logger = types.SimpleNamespace(propagate=True)
+
+  def event(self, key, value=None, metadata=None, **kwargs): self.calls.append(("event", key, value, metadata))
+  def start(self, key, value=None, metadata=None, **kwargs): self.calls.append(("start", key, value, metadata))
+  def end(self, key, value=None, metadata=None, **kwargs): self.calls.append(("end", key, value, metadata))
+
+
+def _fake_mlperf_logging():
+  logger = _FakeMLLogger()
+  constants = types.ModuleType("mlperf_logging.mllog.constants")
+  for key, value in {
+    "BLOCK_START": "block_start",
+    "BLOCK_STOP": "block_stop",
+    "EVAL_START": "eval_start",
+    "EVAL_ACCURACY": "eval_accuracy",
+    "EVAL_STOP": "eval_stop",
+    "TRAIN_SAMPLES": "train_samples",
+    "RUN_STOP": "run_stop",
+    "SAMPLES_COUNT": "samples_count",
+    "STATUS": "status",
+    "SUCCESS": "success",
+    "ABORTED": "aborted",
+  }.items():
+    setattr(constants, key, value)
+  mllog = types.ModuleType("mlperf_logging.mllog")
+  mllog.config = lambda **kwargs: None
+  mllog.get_mllogger = lambda: logger
+  package = types.ModuleType("mlperf_logging")
+  package.mllog = mllog
+  return {
+    "mlperf_logging": package,
+    "mlperf_logging.mllog": mllog,
+    "mlperf_logging.mllog.constants": constants,
+  }, logger
+
+
 def _fake_flux_batch(batch_size:int, txt_tokens:int=8, timestep_offset:int=0) -> dict[str, Tensor]:
   return {
     "mean": Tensor.zeros(batch_size, 16, 32, 32, dtype=dtypes.default_float, device="CPU").contiguous().realize(),
@@ -201,6 +240,62 @@ class TestMLPerfFluxEval(unittest.TestCase):
 
     self.assertIn("Set the same FLUX_* debug model-shape overrides used during training.", str(cm.exception))
     self.assertIn("hidden_size", str(cm.exception))
+
+  def test_eval_flux_mlperf_logs_checkpoint_samples(self):
+    with tempfile.TemporaryDirectory(prefix="flux-eval-mlperf-") as tmpdir:
+      ckpt_path = Path(tmpdir) / "flux_step2.safetensors"
+      safe_save({"model.weight": Tensor([1.0], device="CPU")}, str(ckpt_path),
+                metadata={"flux_model_config": dict(flux_helpers.FLUX_MLPERF_MODEL_CONFIG), "flux_global_batch_size": 4})
+
+      original_env = {k: os.environ.get(k) for k in ("MODEL", "GPUS", "BS", "DATADIR", "VAL_DATASET", "EVAL_CKPT_DIR",
+                                                     "STOP_IF_CONVERGED", "RUNMLPERF", "LOGMLPERF")}
+      os.environ.update({
+        "MODEL": "flux",
+        "GPUS": "1",
+        "BS": "2",
+        "DATADIR": str(Path(tmpdir) / "dataset-root"),
+        "EVAL_CKPT_DIR": tmpdir,
+        "STOP_IF_CONVERGED": "0",
+        "RUNMLPERF": "1",
+        "LOGMLPERF": "1",
+      })
+      getenv.cache_clear()
+      fake_modules, logger = _fake_mlperf_logging()
+
+      fake_flux_module = types.ModuleType("extra.models.flux")
+      class FakeFluxParams:
+        def __init__(self, **kwargs): self.kwargs = kwargs
+      class FakeFlux:
+        def __init__(self, params): self.params = params
+      fake_flux_module.Flux = FakeFlux
+      fake_flux_module.FluxParams = FakeFluxParams
+
+      def fake_loader(dataset_path, bs):
+        self.assertEqual(dataset_path, str(Path(os.environ["DATADIR"]) / "val-*"))
+        self.assertEqual(bs, 2)
+        yield _fake_flux_batch(bs)
+
+      try:
+        with patch.dict(sys.modules, {"extra.models.flux": fake_flux_module} | fake_modules), \
+             patch.object(model_eval, "Device", _FakeDevice()), \
+             patch.object(model_eval, "TinyJit", _identity_jit), \
+             patch.object(Tensor, "shard_", lambda self, devices, axis=0: self), \
+             patch.object(initializers, "init_flux", side_effect=lambda model, pretrained, devices, strict=True: model), \
+             patch.object(model_eval, "load_state_dict", side_effect=lambda model, state, strict=True: None), \
+             patch.object(flux_helpers, "flux_validation_losses", side_effect=lambda *args, **kwargs: Tensor([0.1, 0.1], device="CPU")), \
+             patch("examples.mlperf.dataloader.batch_load_val_flux_preprocessed", side_effect=fake_loader):
+          validation_loss, ckpt_iteration = model_eval.eval_flux()
+      finally:
+        for key, value in original_env.items():
+          if value is None: os.environ.pop(key, None)
+          else: os.environ[key] = value
+        getenv.cache_clear()
+
+    self.assertEqual(ckpt_iteration, 2)
+    self.assertAlmostEqual(validation_loss, 0.1)
+    self.assertIn(("end", "block_stop", None, {"samples_count": 8}), logger.calls)
+    self.assertIn(("event", "train_samples", 8, None), logger.calls)
+    self.assertIn(("end", "run_stop", None, {"status": "success"}), logger.calls)
 
 
 if __name__ == "__main__":

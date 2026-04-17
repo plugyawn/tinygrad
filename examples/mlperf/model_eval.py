@@ -263,12 +263,25 @@ def eval_flux():
   for x in GPUS: Device[x]
   print(f"running flux eval on {GPUS}")
   seed               = config["seed"]                   = getenv("SEED", 12345)
+  RUNMLPERF          = config["RUNMLPERF"]              = getenv("RUNMLPERF")
+  LOGMLPERF          = config["LOGMLPERF"]              = getenv("LOGMLPERF")
   BS                 = config["BS"]                     = getenv("BS", 1 * len(GPUS))
   DATADIR            = config["DATADIR"]                = Path(getenv("DATADIR", "./datasets/flux"))
   VAL_DATASET        = config["VAL_DATASET"]            = getenv("VAL_DATASET", str(DATADIR / "val-*"))
   EVAL_CKPT_DIR      = config["EVAL_CKPT_DIR"]          = getenv("EVAL_CKPT_DIR", "")
   STOP_IF_CONVERGED  = config["STOP_IF_CONVERGED"]      = getenv("STOP_IF_CONVERGED", 0)
   config["MODEL_CONFIG"] = model_config = flux_model_config_from_env()
+
+  if LOGMLPERF:
+    from mlperf_logging import mllog
+    import mlperf_logging.mllog.constants as mllog_constants
+
+    mllog.config(filename=f"result_flux_{seed}.log")
+    mllog.config(root_dir=Path(__file__).parents[3].as_posix())
+    MLLOGGER = mllog.get_mllogger()
+    MLLOGGER.logger.propagate = False
+  else:
+    MLLOGGER = None
 
   if (WANDB := getenv("WANDB", "")):
     import wandb
@@ -281,7 +294,7 @@ def eval_flux():
     if (match:=re.fullmatch(r"(?:flux_step)?(\d+)\.safetensors", p.name)) is not None:
       eval_queue.append((int(match.group(1)), p))
   assert len(eval_queue), f'no Flux step checkpoints matching "flux_step<step>.safetensors" were found in {EVAL_CKPT_DIR}'
-  print(sorted(eval_queue, reverse=True))
+  print(sorted(eval_queue))
 
   Tensor.manual_seed(seed)
   model = init_flux(Flux(FluxParams(**model_config)), None, GPUS, strict=True)
@@ -307,9 +320,10 @@ def eval_flux():
                                                      Tensor(np.concatenate(timestep_ids), dtype=dtypes.int32, device="CPU")).item()
     return float(validation_loss)
 
-  def flux_eval_state_dict(ckpt_path:Path) -> dict[str, Tensor]:
+  def flux_eval_state_dict(ckpt_path:Path) -> tuple[dict[str, Tensor], dict]:
     _, _, metadata = safe_load_metadata(ckpt_path)
-    if (saved_model_config:=metadata.get("__metadata__", {}).get("flux_model_config")) is not None and saved_model_config != model_config:
+    saved_metadata = metadata.get("__metadata__", {})
+    if (saved_model_config:=saved_metadata.get("flux_model_config")) is not None and saved_model_config != model_config:
       mismatched = {k: (saved_model_config.get(k), model_config.get(k)) for k in saved_model_config.keys() | model_config.keys()
                     if saved_model_config.get(k) != model_config.get(k)}
       raise ValueError(
@@ -319,25 +333,44 @@ def eval_flux():
     state_dict = safe_load(ckpt_path)
     if any(k.startswith("model.") for k in state_dict): state_dict = {k.removeprefix("model."):v for k,v in state_dict.items() if k.startswith("model.")}
     assert state_dict, f"no Flux model weights found in {ckpt_path}"
-    return state_dict
+    return state_dict, saved_metadata
 
-  for ckpt_iteration, p in sorted(eval_queue, reverse=True):
+  for ckpt_iteration, p in sorted(eval_queue):
     Tensor.manual_seed(seed)
     try:
-      load_state_dict(model, flux_eval_state_dict(p), strict=True)
+      state_dict, ckpt_metadata = flux_eval_state_dict(p)
+      load_state_dict(model, state_dict, strict=True)
     except (KeyError, ValueError) as e:
       raise ValueError(
         f"Failed to load Flux checkpoint {p.name} into eval model config {model_config}. "
         "Set the same FLUX_* debug model-shape overrides used during training."
       ) from e
+    samples_count = ckpt_iteration * int(ckpt_metadata.get("flux_global_batch_size", getenv("TRAIN_BS", BS)))
+    if MLLOGGER and RUNMLPERF:
+      MLLOGGER.end(key=mllog_constants.BLOCK_STOP, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
+      MLLOGGER.start(key=mllog_constants.EVAL_START, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
     validation_loss = eval_model()
     converged = flux_validation_target_met(validation_loss)
+    if MLLOGGER and RUNMLPERF:
+      MLLOGGER.event(key=mllog_constants.EVAL_ACCURACY, value=validation_loss, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
+      MLLOGGER.end(key=mllog_constants.EVAL_STOP, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
     print(f"eval results for {EVAL_CKPT_DIR}/{p.name}: validation_loss={validation_loss}, target={FLUX_QUALITY_TARGET}, converged={converged}")
     if WANDB:
       wandb.log({"eval/ckpt_iteration": ckpt_iteration, "eval/validation_loss": validation_loss})
-    if converged and STOP_IF_CONVERGED:
-      print(f"Convergence detected, exiting early before evaluating other checkpoints due to STOP_IF_CONVERGED={STOP_IF_CONVERGED}")
-      sys.exit()
+    if converged:
+      if MLLOGGER and RUNMLPERF:
+        MLLOGGER.event(key=mllog_constants.TRAIN_SAMPLES, value=samples_count)
+        MLLOGGER.end(key=mllog_constants.RUN_STOP, metadata={mllog_constants.STATUS: mllog_constants.SUCCESS})
+      if STOP_IF_CONVERGED:
+        print(f"Convergence detected, exiting early before evaluating other checkpoints due to STOP_IF_CONVERGED={STOP_IF_CONVERGED}")
+        sys.exit()
+      if RUNMLPERF:
+        return validation_loss, ckpt_iteration
+    if MLLOGGER and RUNMLPERF:
+      MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
+
+  if MLLOGGER and RUNMLPERF:
+    MLLOGGER.end(key=mllog_constants.RUN_STOP, metadata={mllog_constants.STATUS: getattr(mllog_constants, "ABORTED", "aborted")})
 
   return validation_loss, ckpt_iteration
 

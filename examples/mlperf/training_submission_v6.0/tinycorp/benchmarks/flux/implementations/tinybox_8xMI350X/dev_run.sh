@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PYTHONPATH="."
+CALLER_CWD="${PWD}"
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../../../../../" && pwd)"
+
+resolve_from_caller() {
+  local path="$1"
+  if [[ -z "${path}" || "${path}" == /* ]]; then
+    printf '%s\n' "${path}"
+  else
+    printf '%s/%s\n' "${CALLER_CWD}" "${path}"
+  fi
+}
+
+cd "${REPO_ROOT}"
+
+export PYTHONPATH="${REPO_ROOT}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export DEV="${DEV:-AMD}"
 export MODEL="flux"
@@ -34,7 +49,8 @@ export TRAIN_DATASET="${TRAIN_DATASET:-${DATADIR}/cc12m_preprocessed/*}"
 export VAL_DATASET="${VAL_DATASET:-${DATADIR}/coco_preprocessed/*}"
 export PRETRAINED="${PRETRAINED:-}"
 
-RUN_NAME="${RUN_NAME:-$(date "+%m%d%H%M")}"
+export SEED="${SEED:-$RANDOM}"
+RUN_NAME="${RUN_NAME:-$(date "+%m%d%H%M%S")_${SEED}}"
 export CKPT_ROOT="${CKPT_ROOT:-/raid/weights/flux}"
 export SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${CKPT_ROOT}/training_checkpoints/${RUN_NAME}}"
 export EVAL_CKPT_DIR="${EVAL_CKPT_DIR:-$SAVE_CKPT_DIR}"
@@ -52,6 +68,14 @@ if [[ -z "${TRAIN_STEPS:-}" && -n "${TOTAL_CKPTS}" ]]; then
   export TRAIN_STEPS=$((CKPT_INTERVAL * TOTAL_CKPTS))
 fi
 
+export DATADIR="$(resolve_from_caller "${DATADIR}")"
+export TRAIN_DATASET="$(resolve_from_caller "${TRAIN_DATASET}")"
+export VAL_DATASET="$(resolve_from_caller "${VAL_DATASET}")"
+export PRETRAINED="$(resolve_from_caller "${PRETRAINED}")"
+export CKPT_ROOT="$(resolve_from_caller "${CKPT_ROOT}")"
+export SAVE_CKPT_DIR="$(resolve_from_caller "${SAVE_CKPT_DIR}")"
+export EVAL_CKPT_DIR="$(resolve_from_caller "${EVAL_CKPT_DIR}")"
+
 mkdir -p "${SAVE_CKPT_DIR}"
 
 echo "running flux train with checkpoints in ${SAVE_CKPT_DIR}"
@@ -59,7 +83,11 @@ echo "train_dataset=${TRAIN_DATASET}"
 echo "val_dataset=${VAL_DATASET}"
 echo "BS=${BS} EVAL_BS=${EVAL_BS} CKPT_INTERVAL=${CKPT_INTERVAL} TRAIN_STEPS=${TRAIN_STEPS:-default}"
 
-python3 examples/mlperf/model_train.py
+python3 "${REPO_ROOT}/examples/mlperf/model_train.py"
+
+if [[ "${EVAL_INTERVAL}" != "0" ]]; then
+  exit 0
+fi
 
 shopt -s nullglob
 flux_ckpts=("${EVAL_CKPT_DIR}"/flux_step*.safetensors)
@@ -69,4 +97,4 @@ if (( ${#flux_ckpts[@]} == 0 )); then
 fi
 
 echo "evaluating checkpoints from ${EVAL_CKPT_DIR}"
-BS="${EVAL_BS}" python3 examples/mlperf/model_eval.py
+BS="${EVAL_BS}" python3 "${REPO_ROOT}/examples/mlperf/model_eval.py"
