@@ -1631,6 +1631,283 @@ def train_llama3():
       if MLLOGGER and RUNMLPERF:
         MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
 
+def train_flux():
+  from extra.models.flux import Flux, FluxParams
+  from examples.mlperf.dataloader import batch_load_train_flux_preprocessed, batch_load_val_flux_preprocessed
+  from examples.mlperf.flux import (
+    FLUX_ADAMW_BETA1, FLUX_ADAMW_BETA2, FLUX_ADAMW_EPS, FLUX_ADAMW_WEIGHT_DECAY, FLUX_CLIP_EMBED_DIM, FLUX_EVAL_SAMPLES,
+    FLUX_FIXED_EVAL_TIMESTEPS, FLUX_LR_WARMUP_STEPS, FLUX_QUALITY_TARGET, FLUX_T5_EMBED_DIM, FLUX_T5_MAX_TOKENS,
+    FLUX_TRAIN_SAMPLES, flux_aggregate_validation_loss, flux_checkpoint_step_interval, flux_eval_step_interval,
+    flux_model_config_from_env, flux_train_loss, flux_validation_losses, flux_validation_target_met,
+  )
+  from examples.mlperf.initializers import init_flux
+
+  class FluxWarmupScheduler:
+    def __init__(self, optimizer, base_lr:float, warmup_steps:int):
+      self.optimizer, self.base_lr, self.warmup_steps = optimizer, base_lr, warmup_steps
+      self.epoch_counter = Tensor([0], requires_grad=False, device=self.optimizer.device)
+      self.optimizer.lr.assign(self.get_lr()).realize()
+
+    def get_lr(self) -> Tensor:
+      if self.warmup_steps <= 0:
+        return Tensor([self.base_lr], requires_grad=False, device=self.optimizer.device, dtype=self.optimizer.lr.dtype)
+      return (((self.epoch_counter + 1) / self.warmup_steps).minimum(1.0) * self.base_lr).cast(self.optimizer.lr.dtype)
+
+    def step(self) -> None:
+      self.epoch_counter.assign(self.epoch_counter + 1).realize()
+      self.optimizer.lr.assign(self.get_lr()).realize()
+
+  INITMLPERF = getenv("INITMLPERF")
+  RUNMLPERF = getenv("RUNMLPERF")
+  LOGMLPERF = getenv("LOGMLPERF")
+  BENCHMARK = getenv("BENCHMARK")
+
+  config = {}
+  seed = config["SEED"] = getenv("SEED", 1234)
+  Tensor.manual_seed(seed)
+
+  if LOGMLPERF:
+    from mlperf_logging import mllog
+    import mlperf_logging.mllog.constants as mllog_constants
+
+    mllog.config(filename=f"result_flux_{seed}.log")
+    mllog.config(root_dir=Path(__file__).parents[3].as_posix())
+    MLLOGGER = mllog.get_mllogger()
+    MLLOGGER.logger.propagate = False
+
+    flux_benchmark = getattr(mllog_constants, "FLUX1", getattr(mllog_constants, "FLUX_1", getattr(mllog_constants, "FLUX", "flux1")))
+
+    if INITMLPERF:
+      assert BENCHMARK, "BENCHMARK must be set for INITMLPERF"
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_ORG, value="tinycorp")
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_PLATFORM, value=getenv("SUBMISSION_PLATFORM", "tinybox"))
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_DIVISION, value=mllog_constants.CLOSED)
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_STATUS, value=mllog_constants.ONPREM)
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_BENCHMARK, value=flux_benchmark)
+      diskcache_clear()
+      MLLOGGER.event(key=mllog_constants.CACHE_CLEAR, value=True)
+      MLLOGGER.start(key=mllog_constants.INIT_START, value=None)
+
+    if RUNMLPERF:
+      MLLOGGER.start(key=mllog_constants.RUN_START, value=None)
+      MLLOGGER.event(key=mllog_constants.SEED, value=seed)
+  else:
+    MLLOGGER = None
+
+  config["GPUS"] = GPUS = [f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1))]
+  print(f"training on {GPUS}")
+  for x in GPUS: Device[x]
+
+  FAKEDATA = config["FAKEDATA"] = bool(getenv("FAKEDATA", 0))
+  config["TRAIN_BEAM"] = TRAIN_BEAM = getenv("TRAIN_BEAM", BEAM.value)
+  config["EVAL_BEAM"] = EVAL_BEAM = getenv("EVAL_BEAM", BEAM.value)
+  config["DEFAULT_FLOAT"] = dtypes.default_float.name
+
+  config["BS"] = BS = getenv("BS", max(len(GPUS), 1))
+  config["EVAL_BS"] = EVAL_BS = getenv("EVAL_BS", BS)
+  config["LR"] = lr = getenv("LR", 1e-4)
+  config["MAX_NORM"] = max_norm = getenv("MAX_NORM", 1.0)
+  config["WARMUP_STEPS"] = warmup_steps = getenv("WARMUP_STEPS", FLUX_LR_WARMUP_STEPS)
+  config["TRAIN_STEPS"] = train_steps = getenv("TRAIN_STEPS", BENCHMARK or (1 if FAKEDATA else 30_000))
+  config["EVAL_STEPS"] = eval_steps = getenv("EVAL_STEPS", 1 if FAKEDATA else math.ceil(FLUX_EVAL_SAMPLES / EVAL_BS))
+  config["EVAL_INTERVAL"] = eval_interval = getenv("EVAL_INTERVAL", 1 if FAKEDATA else flux_eval_step_interval(BS))
+  config["CKPT"] = ckpt_enabled = getenv("CKPT", 0)
+  config["CKPT_INTERVAL"] = ckpt_interval = getenv("CKPT_INTERVAL", flux_checkpoint_step_interval(BS))
+  config["TARGET"] = target = getenv("TARGET", FLUX_QUALITY_TARGET)
+
+  DATADIR = Path(getenv("DATADIR", "./datasets"))
+  config["TRAIN_DATASET"] = train_dataset = getenv("TRAIN_DATASET", (DATADIR / "cc12m_preprocessed" / "*").as_posix())
+  config["VAL_DATASET"] = val_dataset = getenv("VAL_DATASET", (DATADIR / "coco_preprocessed" / "*").as_posix())
+  config["PRETRAINED"] = pretrained = getenv("PRETRAINED", "")
+  config["SAVE_CKPT_DIR"] = save_ckpt_dir = Path(getenv("SAVE_CKPT_DIR", "./ckpts"))
+
+  config["MODEL_CONFIG"] = model_config = flux_model_config_from_env()
+
+  if MLLOGGER and RUNMLPERF:
+    MLLOGGER.event(key=mllog_constants.GLOBAL_BATCH_SIZE, value=BS)
+    MLLOGGER.event(key=mllog_constants.MAX_STEPS, value=train_steps)
+    MLLOGGER.event(key=mllog_constants.GRADIENT_ACCUMULATION_STEPS, value=1)
+    MLLOGGER.event(key=mllog_constants.TRAIN_SAMPLES, value=FLUX_TRAIN_SAMPLES)
+    MLLOGGER.event(key=mllog_constants.EVAL_SAMPLES, value=FLUX_EVAL_SAMPLES)
+    MLLOGGER.event(key=mllog_constants.OPT_NAME, value=mllog_constants.ADAMW)
+    MLLOGGER.event(key=mllog_constants.OPT_BASE_LR, value=lr)
+    MLLOGGER.event(key=mllog_constants.OPT_ADAMW_BETA_1, value=FLUX_ADAMW_BETA1)
+    MLLOGGER.event(key=mllog_constants.OPT_ADAMW_BETA_2, value=FLUX_ADAMW_BETA2)
+    MLLOGGER.event(key=mllog_constants.OPT_ADAMW_EPSILON, value=FLUX_ADAMW_EPS)
+    MLLOGGER.event(key=mllog_constants.OPT_ADAMW_WEIGHT_DECAY, value=FLUX_ADAMW_WEIGHT_DECAY)
+    MLLOGGER.event(key=mllog_constants.OPT_GRADIENT_CLIP_NORM, value=max_norm)
+    MLLOGGER.event(key=mllog_constants.OPT_LR_WARMUP_STEPS, value=warmup_steps)
+    MLLOGGER.event(key=mllog_constants.NUM_WARMUP_STEPS, value=warmup_steps)
+
+  fake_txt_tokens = config["FLUX_T5_TOKENS"] = getenv("FLUX_T5_TOKENS", 16 if FAKEDATA else FLUX_T5_MAX_TOKENS)
+  model = init_flux(Flux(FluxParams(**model_config)), pretrained or None, GPUS, strict=not FAKEDATA)
+  params = get_parameters(model)
+  optimizer = AdamW(params, lr=lr, b1=FLUX_ADAMW_BETA1, b2=FLUX_ADAMW_BETA2, eps=FLUX_ADAMW_EPS, weight_decay=FLUX_ADAMW_WEIGHT_DECAY)
+  scheduler = FluxWarmupScheduler(optimizer, lr, warmup_steps)
+  checkpoint_metadata = {"flux_model_config": model_config, "flux_global_batch_size": BS}
+
+  def save_training_checkpoint(step:int):
+    save_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    fn = save_ckpt_dir / f"flux_step{step}.safetensors"
+    print(f"saving ckpt to {fn}")
+    safe_save(get_training_state(model, optimizer, scheduler), str(fn), metadata=checkpoint_metadata)
+
+  def save_model_checkpoint():
+    save_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    fn = save_ckpt_dir / "flux.safetensors"
+    print(f"saving model to {fn}")
+    safe_save(get_state_dict(model), str(fn), metadata=checkpoint_metadata)
+
+  def fake_batch(batch_size:int, include_timestep:bool=False, offset:int=0) -> dict[str, Tensor]:
+    batch:dict[str, Tensor] = {
+      "mean": Tensor.zeros(batch_size, 16, 32, 32, dtype=dtypes.default_float, device="CPU"),
+      "logvar": Tensor.zeros(batch_size, 16, 32, 32, dtype=dtypes.default_float, device="CPU"),
+      "t5_encodings": Tensor.zeros(batch_size, fake_txt_tokens, FLUX_T5_EMBED_DIM, dtype=dtypes.default_float, device="CPU"),
+      "clip_encodings": Tensor.zeros(batch_size, FLUX_CLIP_EMBED_DIM, dtype=dtypes.default_float, device="CPU"),
+    }
+    if include_timestep:
+      batch["timestep"] = Tensor([(offset + i) % len(FLUX_FIXED_EVAL_TIMESTEPS) for i in range(batch_size)], dtype=dtypes.int32, device="CPU")
+    return batch
+
+  def get_train_iter():
+    if FAKEDATA:
+      while True: yield fake_batch(BS)
+    else:
+      while True: yield from batch_load_train_flux_preprocessed(train_dataset, BS)
+
+  def get_eval_iter():
+    if FAKEDATA:
+      for i in range(eval_steps): yield fake_batch(EVAL_BS, include_timestep=True, offset=i * EVAL_BS)
+    else:
+      yield from batch_load_val_flux_preprocessed(val_dataset, EVAL_BS)
+
+  def move_tensor(x:Tensor) -> Tensor:
+    x = x.cast(dtypes.default_float) if dtypes.is_float(x.dtype) else x
+    return x.shard(GPUS, axis=0) if len(GPUS) > 1 else x.to(GPUS[0])
+
+  def prepare_train_batch(batch:dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    mean, logvar, txt, vec = (move_tensor(batch[k]) for k in ("mean", "logvar", "t5_encodings", "clip_encodings"))
+    Tensor.realize(mean, logvar, txt, vec)
+    return mean, logvar, txt, vec
+
+  def prepare_eval_batch(batch:dict[str, Tensor], offset:int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    mean, logvar, txt, vec = prepare_train_batch(batch)
+    timestep_ids = batch.get("timestep", Tensor([(offset + i) % len(FLUX_FIXED_EVAL_TIMESTEPS) for i in range(batch["mean"].shape[0])],
+                                                dtype=dtypes.int32, device="CPU"))
+    timestep_ids = timestep_ids.shard(GPUS, axis=0) if len(GPUS) > 1 else timestep_ids.to(GPUS[0])
+    Tensor.realize(timestep_ids)
+    return mean, logvar, txt, vec, timestep_ids
+
+  @TinyJit
+  def train_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor):
+    optimizer.zero_grad()
+    loss = flux_train_loss(model, mean, logvar, txt, vec)
+    loss.backward()
+
+    global_norm = Tensor(0.0, dtype=dtypes.float32, device=optimizer.device)
+    for p in optimizer.params: global_norm += p.grad.float().square().sum()
+    global_norm = global_norm.sqrt().contiguous()
+    clip_scale = (max_norm / global_norm.maximum(max_norm)).cast(dtypes.float32) if max_norm > 0 else 1.0
+    for p in optimizer.params: p.grad = (p.grad * clip_scale).cast(p.grad.dtype).contiguous()
+
+    optimizer.step()
+    scheduler.step()
+    Tensor.realize(loss, global_norm, optimizer.lr)
+    return loss, global_norm, optimizer.lr
+
+  @TinyJit
+  def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor):
+    losses = flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids)
+    losses_cpu = losses.float().to("CPU")
+    timestep_ids_cpu = timestep_ids.to("CPU")
+    Tensor.realize(losses_cpu, timestep_ids_cpu)
+    return losses_cpu, timestep_ids_cpu
+
+  def run_eval(step:int) -> tuple[float, bool]:
+    if getenv("RESET_STEP", 1): train_step.reset()
+    if eval_steps <= 0: return math.inf, False
+    BEAM.value = EVAL_BEAM
+    losses:list[float] = []
+    timestep_ids:list[int] = []
+    eval_times = []
+    with Tensor.train(mode=False):
+      for eval_idx, batch in enumerate(get_eval_iter()):
+        if eval_idx == eval_steps: break
+        GlobalCounters.reset()
+        st = time.perf_counter()
+        loss_batch, timestep_batch = eval_step(*prepare_eval_batch(batch, eval_idx * EVAL_BS))
+        eval_times.append(time.perf_counter() - st)
+        losses.extend(loss_batch.numpy().reshape(-1).tolist())
+        timestep_ids.extend(map(int, timestep_batch.numpy().reshape(-1).tolist()))
+        if BENCHMARK and (eval_idx + 1) == min(BENCHMARK, eval_steps):
+          if MLLOGGER and INITMLPERF:
+            MLLOGGER.end(key=mllog_constants.INIT_STOP, value=None)
+          return math.inf, True
+    if getenv("RESET_STEP", 1): eval_step.reset()
+    if not losses: return math.inf, False
+    validation_loss = flux_aggregate_validation_loss(Tensor(losses, dtype=dtypes.float32), Tensor(timestep_ids, dtype=dtypes.int32)).item()
+    avg_eval_time = sum(eval_times) / len(eval_times)
+    tqdm.write(f"eval step {step}: loss {validation_loss:.5f}, avg eval time {avg_eval_time:.4f}s")
+    return validation_loss, False
+
+  print(f"training with batch size {BS} for {train_steps} step(s)")
+  print(f"model parameters: {sum(p.numel() for p in params):_}")
+
+  train_iter = get_train_iter()
+  last_eval_loss = math.inf
+  BEAM.value = TRAIN_BEAM
+  if MLLOGGER and RUNMLPERF:
+    MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: 0})
+  for step in range(1, train_steps + 1):
+    Tensor.training = True
+    BEAM.value = TRAIN_BEAM
+    GlobalCounters.reset()
+    batch = next(train_iter)
+    prep_st = time.perf_counter()
+    train_batch = prepare_train_batch(batch)
+    train_st = time.perf_counter()
+    loss, grad_norm, out_lr = train_step(*train_batch)
+    train_et = time.perf_counter()
+
+    loss_item, grad_norm_item, lr_item = loss.item(), grad_norm.item(), out_lr.item()
+    device_str = params[0].device if isinstance(params[0].device, str) else f"{params[0].device[0]} * {len(params[0].device)}"
+    if not math.isfinite(loss_item):
+      raise RuntimeError(f"Flux loss became non-finite at step {step}: {loss_item}")
+
+    tqdm.write(
+      f"step {step:5d}: {(train_et - prep_st):7.3f}s total, {(train_st - prep_st):7.3f}s input, {(train_et - train_st):7.3f}s train, "
+      f"{device_str}, loss {loss_item:8.5f}, grad_norm {grad_norm_item:8.5f}, lr {lr_item:.6f}, "
+      f"{GlobalCounters.mem_used / 1e9:.2f} GB used, {GlobalCounters.global_ops * 1e-9 / max(train_et - train_st, 1e-12):9.2f} GFLOPS"
+    )
+
+    if ckpt_enabled and step % ckpt_interval == 0:
+      save_training_checkpoint(step)
+
+    if eval_interval > 0 and (step % eval_interval == 0 or step == train_steps):
+      samples_seen = step * BS
+      if MLLOGGER and RUNMLPERF:
+        MLLOGGER.end(key=mllog_constants.BLOCK_STOP, metadata={mllog_constants.SAMPLES_COUNT: samples_seen})
+        MLLOGGER.start(key=mllog_constants.EVAL_START, metadata={mllog_constants.SAMPLES_COUNT: samples_seen})
+
+      last_eval_loss, init_complete = run_eval(step)
+      if init_complete: return last_eval_loss
+
+      if MLLOGGER and RUNMLPERF:
+        MLLOGGER.event(key=mllog_constants.EVAL_ACCURACY, value=last_eval_loss, metadata={mllog_constants.SAMPLES_COUNT: samples_seen})
+        MLLOGGER.end(key=mllog_constants.EVAL_STOP, metadata={mllog_constants.SAMPLES_COUNT: samples_seen})
+
+      if flux_validation_target_met(last_eval_loss, target):
+        tqdm.write(f"Flux target {target} reached at step {step} with validation_loss {last_eval_loss:.5f}")
+        if MLLOGGER and RUNMLPERF:
+          MLLOGGER.event(key=mllog_constants.TRAIN_SAMPLES, value=samples_seen)
+          MLLOGGER.end(key=mllog_constants.RUN_STOP, metadata={mllog_constants.STATUS: mllog_constants.SUCCESS})
+        save_model_checkpoint()
+        return last_eval_loss
+      if MLLOGGER and RUNMLPERF:
+        MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: samples_seen})
+
+  return last_eval_loss
+
 def train_stable_diffusion():
   from extra.models.unet import UNetModel
   from examples.mlperf.dataloader import batch_load_train_stable_diffusion

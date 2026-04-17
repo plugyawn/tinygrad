@@ -3,7 +3,7 @@ start = time.perf_counter()
 from pathlib import Path
 import numpy as np
 from tinygrad import Tensor, Device, dtypes, GlobalCounters, TinyJit
-from tinygrad.nn.state import get_parameters, load_state_dict, safe_load
+from tinygrad.nn.state import get_parameters, load_state_dict, safe_load, safe_load_metadata
 from tinygrad.helpers import getenv, Context, prod
 from extra.bench_log import BenchEvent, WallTimeEvent
 def tlog(x): print(f"{x:25s}  @ {time.perf_counter()-start:5.2f}s")
@@ -246,6 +246,133 @@ def eval_llama3():
 
   log_perplexity = np.mean(losses)
   print(f"Log Perplexity: {log_perplexity}")
+
+def eval_flux():
+  import re, sys
+  from tinygrad.helpers import tqdm
+  from extra.models.flux import Flux, FluxParams
+  from examples.mlperf.dataloader import batch_load_val_flux_preprocessed
+  from examples.mlperf.flux import (
+    FLUX_QUALITY_TARGET, flux_aggregate_validation_loss, flux_model_config_from_env,
+    flux_validation_losses, flux_validation_target_met,
+  )
+  from examples.mlperf.initializers import init_flux
+
+  config = {}
+  GPUS               = config["GPUS"]                   = [f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1))]
+  for x in GPUS: Device[x]
+  print(f"running flux eval on {GPUS}")
+  seed               = config["seed"]                   = getenv("SEED", 12345)
+  RUNMLPERF          = config["RUNMLPERF"]              = getenv("RUNMLPERF")
+  LOGMLPERF          = config["LOGMLPERF"]              = getenv("LOGMLPERF")
+  BS                 = config["BS"]                     = getenv("BS", 1 * len(GPUS))
+  DATADIR            = config["DATADIR"]                = Path(getenv("DATADIR", "./datasets/flux"))
+  VAL_DATASET        = config["VAL_DATASET"]            = getenv("VAL_DATASET", str(DATADIR / "val-*"))
+  EVAL_CKPT_DIR      = config["EVAL_CKPT_DIR"]          = getenv("EVAL_CKPT_DIR", "")
+  STOP_IF_CONVERGED  = config["STOP_IF_CONVERGED"]      = getenv("STOP_IF_CONVERGED", 0)
+  config["MODEL_CONFIG"] = model_config = flux_model_config_from_env()
+
+  if LOGMLPERF:
+    from mlperf_logging import mllog
+    import mlperf_logging.mllog.constants as mllog_constants
+
+    mllog.config(filename=f"result_flux_{seed}.log")
+    mllog.config(root_dir=Path(__file__).parents[3].as_posix())
+    MLLOGGER = mllog.get_mllogger()
+    MLLOGGER.logger.propagate = False
+  else:
+    MLLOGGER = None
+
+  if (WANDB := getenv("WANDB", "")):
+    import wandb
+    wandb.init(config=config, project="MLPerf-Flux")
+
+  assert EVAL_CKPT_DIR != "", "provide a directory with checkpoints to be evaluated"
+  print(f"running eval on checkpoints in {EVAL_CKPT_DIR}\nSEED={seed}")
+  eval_queue:list[tuple[int, Path]] = []
+  for p in Path(EVAL_CKPT_DIR).iterdir():
+    if (match:=re.fullmatch(r"(?:flux_step)?(\d+)\.safetensors", p.name)) is not None:
+      eval_queue.append((int(match.group(1)), p))
+  assert len(eval_queue), f'no Flux step checkpoints matching "flux_step<step>.safetensors" were found in {EVAL_CKPT_DIR}'
+  print(sorted(eval_queue))
+
+  Tensor.manual_seed(seed)
+  model = init_flux(Flux(FluxParams(**model_config)), None, GPUS, strict=True)
+
+  @TinyJit
+  def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor, latent_noise:Tensor, flow_noise:Tensor) -> Tensor:
+    for t in (mean, logvar, txt, vec, timestep_ids, latent_noise, flow_noise): t.shard_(GPUS, axis=0)
+    return flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids,
+                                  latent_noise=latent_noise, flow_noise=flow_noise).to("CPU").realize()
+
+  @Tensor.train(mode=False)
+  def eval_model() -> float:
+    losses, timestep_ids = [], []
+    for batch in tqdm(batch_load_val_flux_preprocessed(VAL_DATASET, BS)):
+      assert "timestep" in batch, "Flux eval expects preprocessed validation samples with timestep bucket ids"
+      mean, logvar = batch["mean"], batch["logvar"]
+      batch_timestep_ids = batch["timestep"].numpy()
+      losses.append(eval_step(mean, logvar, batch["t5_encodings"], batch["clip_encodings"], batch["timestep"],
+                              Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype), Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype)).numpy())
+      timestep_ids.append(batch_timestep_ids)
+    assert losses, f"no validation samples were loaded from {VAL_DATASET}"
+    validation_loss = flux_aggregate_validation_loss(Tensor(np.concatenate(losses), dtype=dtypes.float32, device="CPU"),
+                                                     Tensor(np.concatenate(timestep_ids), dtype=dtypes.int32, device="CPU")).item()
+    return float(validation_loss)
+
+  def flux_eval_state_dict(ckpt_path:Path) -> tuple[dict[str, Tensor], dict]:
+    _, _, metadata = safe_load_metadata(ckpt_path)
+    saved_metadata = metadata.get("__metadata__", {})
+    if (saved_model_config:=saved_metadata.get("flux_model_config")) is not None and saved_model_config != model_config:
+      mismatched = {k: (saved_model_config.get(k), model_config.get(k)) for k in saved_model_config.keys() | model_config.keys()
+                    if saved_model_config.get(k) != model_config.get(k)}
+      raise ValueError(
+        f"Flux checkpoint {ckpt_path.name} was saved with model config {saved_model_config}, but eval is configured with {model_config}. "
+        f"Set the same FLUX_* debug model-shape overrides used during training. Mismatched fields: {mismatched}"
+      )
+    state_dict = safe_load(ckpt_path)
+    if any(k.startswith("model.") for k in state_dict): state_dict = {k.removeprefix("model."):v for k,v in state_dict.items() if k.startswith("model.")}
+    assert state_dict, f"no Flux model weights found in {ckpt_path}"
+    return state_dict, saved_metadata
+
+  for ckpt_iteration, p in sorted(eval_queue):
+    Tensor.manual_seed(seed)
+    try:
+      state_dict, ckpt_metadata = flux_eval_state_dict(p)
+      load_state_dict(model, state_dict, strict=True)
+    except (KeyError, ValueError) as e:
+      raise ValueError(
+        f"Failed to load Flux checkpoint {p.name} into eval model config {model_config}. "
+        "Set the same FLUX_* debug model-shape overrides used during training."
+      ) from e
+    samples_count = ckpt_iteration * int(ckpt_metadata.get("flux_global_batch_size", getenv("TRAIN_BS", BS)))
+    if MLLOGGER and RUNMLPERF:
+      MLLOGGER.end(key=mllog_constants.BLOCK_STOP, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
+      MLLOGGER.start(key=mllog_constants.EVAL_START, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
+    validation_loss = eval_model()
+    converged = flux_validation_target_met(validation_loss)
+    if MLLOGGER and RUNMLPERF:
+      MLLOGGER.event(key=mllog_constants.EVAL_ACCURACY, value=validation_loss, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
+      MLLOGGER.end(key=mllog_constants.EVAL_STOP, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
+    print(f"eval results for {EVAL_CKPT_DIR}/{p.name}: validation_loss={validation_loss}, target={FLUX_QUALITY_TARGET}, converged={converged}")
+    if WANDB:
+      wandb.log({"eval/ckpt_iteration": ckpt_iteration, "eval/validation_loss": validation_loss})
+    if converged:
+      if MLLOGGER and RUNMLPERF:
+        MLLOGGER.event(key=mllog_constants.TRAIN_SAMPLES, value=samples_count)
+        MLLOGGER.end(key=mllog_constants.RUN_STOP, metadata={mllog_constants.STATUS: mllog_constants.SUCCESS})
+      if STOP_IF_CONVERGED:
+        print(f"Convergence detected, exiting early before evaluating other checkpoints due to STOP_IF_CONVERGED={STOP_IF_CONVERGED}")
+        sys.exit()
+      if RUNMLPERF:
+        return validation_loss, ckpt_iteration
+    if MLLOGGER and RUNMLPERF:
+      MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: samples_count})
+
+  if MLLOGGER and RUNMLPERF:
+    MLLOGGER.end(key=mllog_constants.RUN_STOP, metadata={mllog_constants.STATUS: getattr(mllog_constants, "ABORTED", "aborted")})
+
+  return validation_loss, ckpt_iteration
 
 # NOTE: BEAM hangs on 8xmi300x with DECODE_BS=384 in final realize below; function is declared here for external testing
 @TinyJit
