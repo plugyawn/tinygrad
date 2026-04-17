@@ -3,7 +3,7 @@ start = time.perf_counter()
 from pathlib import Path
 import numpy as np
 from tinygrad import Tensor, Device, dtypes, GlobalCounters, TinyJit
-from tinygrad.nn.state import get_parameters, load_state_dict, safe_load
+from tinygrad.nn.state import get_parameters, load_state_dict, safe_load, safe_load_metadata
 from tinygrad.helpers import getenv, Context, prod
 from extra.bench_log import BenchEvent, WallTimeEvent
 def tlog(x): print(f"{x:25s}  @ {time.perf_counter()-start:5.2f}s")
@@ -252,7 +252,10 @@ def eval_flux():
   from tinygrad.helpers import tqdm
   from extra.models.flux import Flux, FluxParams
   from examples.mlperf.dataloader import batch_load_val_flux_preprocessed
-  from examples.mlperf.flux import FLUX_MLPERF_MODEL_CONFIG, FLUX_QUALITY_TARGET, flux_aggregate_validation_loss, flux_validation_losses, flux_validation_target_met
+  from examples.mlperf.flux import (
+    FLUX_QUALITY_TARGET, flux_aggregate_validation_loss, flux_model_config_from_env,
+    flux_validation_losses, flux_validation_target_met,
+  )
   from examples.mlperf.initializers import init_flux
 
   config = {}
@@ -265,6 +268,7 @@ def eval_flux():
   VAL_DATASET        = config["VAL_DATASET"]            = getenv("VAL_DATASET", str(DATADIR / "val-*"))
   EVAL_CKPT_DIR      = config["EVAL_CKPT_DIR"]          = getenv("EVAL_CKPT_DIR", "")
   STOP_IF_CONVERGED  = config["STOP_IF_CONVERGED"]      = getenv("STOP_IF_CONVERGED", 0)
+  config["MODEL_CONFIG"] = model_config = flux_model_config_from_env()
 
   if (WANDB := getenv("WANDB", "")):
     import wandb
@@ -274,15 +278,13 @@ def eval_flux():
   print(f"running eval on checkpoints in {EVAL_CKPT_DIR}\nSEED={seed}")
   eval_queue:list[tuple[int, Path]] = []
   for p in Path(EVAL_CKPT_DIR).iterdir():
-    if p.name.endswith(".safetensors"):
-      match = re.fullmatch(r"(?:flux_step)?(\d+)", p.stem)
-      assert match is not None, f"invalid checkpoint name: {p.name}, expected <digits>.safetensors or flux_step<digits>.safetensors"
+    if (match:=re.fullmatch(r"(?:flux_step)?(\d+)\.safetensors", p.name)) is not None:
       eval_queue.append((int(match.group(1)), p))
-  assert len(eval_queue), f'no files ending with ".safetensors" were found in {EVAL_CKPT_DIR}'
+  assert len(eval_queue), f'no Flux step checkpoints matching "flux_step<step>.safetensors" were found in {EVAL_CKPT_DIR}'
   print(sorted(eval_queue, reverse=True))
 
   Tensor.manual_seed(seed)
-  model = init_flux(Flux(FluxParams(**FLUX_MLPERF_MODEL_CONFIG)), None, GPUS, strict=True)
+  model = init_flux(Flux(FluxParams(**model_config)), None, GPUS, strict=True)
 
   @TinyJit
   def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor, latent_noise:Tensor, flow_noise:Tensor) -> Tensor:
@@ -306,6 +308,14 @@ def eval_flux():
     return float(validation_loss)
 
   def flux_eval_state_dict(ckpt_path:Path) -> dict[str, Tensor]:
+    _, _, metadata = safe_load_metadata(ckpt_path)
+    if (saved_model_config:=metadata.get("__metadata__", {}).get("flux_model_config")) is not None and saved_model_config != model_config:
+      mismatched = {k: (saved_model_config.get(k), model_config.get(k)) for k in saved_model_config.keys() | model_config.keys()
+                    if saved_model_config.get(k) != model_config.get(k)}
+      raise ValueError(
+        f"Flux checkpoint {ckpt_path.name} was saved with model config {saved_model_config}, but eval is configured with {model_config}. "
+        f"Set the same FLUX_* debug model-shape overrides used during training. Mismatched fields: {mismatched}"
+      )
     state_dict = safe_load(ckpt_path)
     if any(k.startswith("model.") for k in state_dict): state_dict = {k.removeprefix("model."):v for k,v in state_dict.items() if k.startswith("model.")}
     assert state_dict, f"no Flux model weights found in {ckpt_path}"
@@ -313,7 +323,13 @@ def eval_flux():
 
   for ckpt_iteration, p in sorted(eval_queue, reverse=True):
     Tensor.manual_seed(seed)
-    load_state_dict(model, flux_eval_state_dict(p), strict=True)
+    try:
+      load_state_dict(model, flux_eval_state_dict(p), strict=True)
+    except (KeyError, ValueError) as e:
+      raise ValueError(
+        f"Failed to load Flux checkpoint {p.name} into eval model config {model_config}. "
+        "Set the same FLUX_* debug model-shape overrides used during training."
+      ) from e
     validation_loss = eval_model()
     converged = flux_validation_target_met(validation_loss)
     print(f"eval results for {EVAL_CKPT_DIR}/{p.name}: validation_loss={validation_loss}, target={FLUX_QUALITY_TARGET}, converged={converged}")

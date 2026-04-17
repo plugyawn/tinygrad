@@ -1633,10 +1633,10 @@ def train_flux():
   from extra.models.flux import Flux, FluxParams
   from examples.mlperf.dataloader import batch_load_train_flux_preprocessed, batch_load_val_flux_preprocessed
   from examples.mlperf.flux import (
-    FLUX_ADAMW_BETA1, FLUX_ADAMW_BETA2, FLUX_ADAMW_EPS, FLUX_ADAMW_WEIGHT_DECAY, FLUX_ATTENTION_HEADS,
-    FLUX_CLIP_EMBED_DIM, FLUX_EVAL_SAMPLES, FLUX_FIXED_EVAL_TIMESTEPS, FLUX_HIDDEN_SIZE, FLUX_LR_WARMUP_STEPS,
-    FLUX_MLPERF_MODEL_CONFIG, FLUX_QUALITY_TARGET, FLUX_T5_EMBED_DIM, FLUX_T5_MAX_TOKENS, flux_aggregate_validation_loss,
-    flux_checkpoint_step_interval, flux_eval_step_interval, flux_train_loss, flux_validation_losses, flux_validation_target_met,
+    FLUX_ADAMW_BETA1, FLUX_ADAMW_BETA2, FLUX_ADAMW_EPS, FLUX_ADAMW_WEIGHT_DECAY, FLUX_CLIP_EMBED_DIM, FLUX_EVAL_SAMPLES,
+    FLUX_FIXED_EVAL_TIMESTEPS, FLUX_LR_WARMUP_STEPS, FLUX_QUALITY_TARGET, FLUX_T5_EMBED_DIM, FLUX_T5_MAX_TOKENS,
+    flux_aggregate_validation_loss, flux_checkpoint_step_interval, flux_eval_step_interval, flux_model_config_from_env, flux_train_loss,
+    flux_validation_losses, flux_validation_target_met,
   )
   from examples.mlperf.initializers import init_flux
 
@@ -1677,6 +1677,7 @@ def train_flux():
   config["TRAIN_STEPS"] = train_steps = getenv("TRAIN_STEPS", BENCHMARK or (1 if FAKEDATA else 30_000))
   config["EVAL_STEPS"] = eval_steps = getenv("EVAL_STEPS", 1 if FAKEDATA else math.ceil(FLUX_EVAL_SAMPLES / EVAL_BS))
   config["EVAL_INTERVAL"] = eval_interval = getenv("EVAL_INTERVAL", 1 if FAKEDATA else flux_eval_step_interval(BS))
+  config["CKPT"] = ckpt_enabled = getenv("CKPT", 0)
   config["CKPT_INTERVAL"] = ckpt_interval = getenv("CKPT_INTERVAL", flux_checkpoint_step_interval(BS))
   config["TARGET"] = target = getenv("TARGET", FLUX_QUALITY_TARGET)
 
@@ -1686,44 +1687,26 @@ def train_flux():
   config["PRETRAINED"] = pretrained = getenv("PRETRAINED", "")
   config["SAVE_CKPT_DIR"] = save_ckpt_dir = Path(getenv("SAVE_CKPT_DIR", "./ckpts"))
 
-  model_config = dict(FLUX_MLPERF_MODEL_CONFIG)
-  model_config["hidden_size"] = getenv("FLUX_HIDDEN_SIZE", model_config["hidden_size"])
-  model_config["depth"] = getenv("FLUX_DOUBLE_STREAM_BLOCKS", model_config["depth"])
-  model_config["depth_single_blocks"] = getenv("FLUX_SINGLE_STREAM_BLOCKS", model_config["depth_single_blocks"])
-  model_config["mlp_ratio"] = getenv("FLUX_MLP_RATIO", model_config["mlp_ratio"])
-  if (num_heads:=getenv("FLUX_ATTENTION_HEADS", 0)):
-    model_config["num_heads"] = num_heads
-  elif model_config["hidden_size"] != FLUX_MLPERF_MODEL_CONFIG["hidden_size"]:
-    default_head_dim = FLUX_HIDDEN_SIZE // FLUX_ATTENTION_HEADS
-    assert model_config["hidden_size"] % default_head_dim == 0, (
-      f"FLUX_HIDDEN_SIZE={model_config['hidden_size']} must be divisible by {default_head_dim} when FLUX_ATTENTION_HEADS is unset"
-    )
-    model_config["num_heads"] = model_config["hidden_size"] // default_head_dim
-  assert model_config["hidden_size"] % model_config["num_heads"] == 0, (
-    f"hidden_size={model_config['hidden_size']} must be divisible by num_heads={model_config['num_heads']}"
-  )
-  assert model_config["hidden_size"] // model_config["num_heads"] == sum(model_config["axes_dim"]), (
-    f"hidden_size/num_heads must equal {sum(model_config['axes_dim'])} to keep Flux positional encoding dimensions aligned"
-  )
-  config["MODEL_CONFIG"] = model_config
+  config["MODEL_CONFIG"] = model_config = flux_model_config_from_env()
 
   fake_txt_tokens = config["FLUX_T5_TOKENS"] = getenv("FLUX_T5_TOKENS", 16 if FAKEDATA else FLUX_T5_MAX_TOKENS)
   model = init_flux(Flux(FluxParams(**model_config)), pretrained or None, GPUS, strict=not FAKEDATA)
   params = get_parameters(model)
   optimizer = AdamW(params, lr=lr, b1=FLUX_ADAMW_BETA1, b2=FLUX_ADAMW_BETA2, eps=FLUX_ADAMW_EPS, weight_decay=FLUX_ADAMW_WEIGHT_DECAY)
   scheduler = FluxWarmupScheduler(optimizer, lr, warmup_steps)
+  checkpoint_metadata = {"flux_model_config": model_config}
 
   def save_training_checkpoint(step:int):
     save_ckpt_dir.mkdir(parents=True, exist_ok=True)
-    fn = save_ckpt_dir / f"flux_step{step}.safe"
+    fn = save_ckpt_dir / f"flux_step{step}.safetensors"
     print(f"saving ckpt to {fn}")
-    safe_save(get_training_state(model, optimizer, scheduler), str(fn))
+    safe_save(get_training_state(model, optimizer, scheduler), str(fn), metadata=checkpoint_metadata)
 
   def save_model_checkpoint():
     save_ckpt_dir.mkdir(parents=True, exist_ok=True)
-    fn = save_ckpt_dir / "flux.safe"
+    fn = save_ckpt_dir / "flux.safetensors"
     print(f"saving model to {fn}")
-    safe_save(get_state_dict(model), str(fn))
+    safe_save(get_state_dict(model), str(fn), metadata=checkpoint_metadata)
 
   def fake_batch(batch_size:int, include_timestep:bool=False, offset:int=0) -> dict[str, Tensor]:
     batch:dict[str, Tensor] = {
@@ -1841,7 +1824,7 @@ def train_flux():
       f"{GlobalCounters.mem_used / 1e9:.2f} GB used, {GlobalCounters.global_ops * 1e-9 / max(train_et - train_st, 1e-12):9.2f} GFLOPS"
     )
 
-    if getenv("CKPT", 0) and step % ckpt_interval == 0:
+    if ckpt_enabled and step % ckpt_interval == 0:
       save_training_checkpoint(step)
 
     if eval_interval > 0 and (step % eval_interval == 0 or step == train_steps):

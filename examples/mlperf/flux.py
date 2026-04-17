@@ -1,6 +1,7 @@
 import math
 
 from tinygrad import Tensor, dtypes
+from tinygrad.helpers import getenv
 
 # MLPerf Training v6.0 / text_to_image reference constants.
 FLUX_IMAGE_SIZE = 256
@@ -56,6 +57,29 @@ FLUX_MLPERF_MODEL_CONFIG = {
   "qkv_bias": True,
   "guidance_embed": False,
 }
+
+
+def flux_model_config_from_env() -> dict[str, int|float|bool|list[int]]:
+  model_config = dict(FLUX_MLPERF_MODEL_CONFIG)
+  model_config["hidden_size"] = getenv("FLUX_HIDDEN_SIZE", model_config["hidden_size"])
+  model_config["depth"] = getenv("FLUX_DOUBLE_STREAM_BLOCKS", model_config["depth"])
+  model_config["depth_single_blocks"] = getenv("FLUX_SINGLE_STREAM_BLOCKS", model_config["depth_single_blocks"])
+  model_config["mlp_ratio"] = getenv("FLUX_MLP_RATIO", model_config["mlp_ratio"])
+  if (num_heads:=getenv("FLUX_ATTENTION_HEADS", 0)):
+    model_config["num_heads"] = num_heads
+  elif model_config["hidden_size"] != FLUX_MLPERF_MODEL_CONFIG["hidden_size"]:
+    default_head_dim = FLUX_HIDDEN_SIZE // FLUX_ATTENTION_HEADS
+    assert model_config["hidden_size"] % default_head_dim == 0, (
+      f"FLUX_HIDDEN_SIZE={model_config['hidden_size']} must be divisible by {default_head_dim} when FLUX_ATTENTION_HEADS is unset"
+    )
+    model_config["num_heads"] = model_config["hidden_size"] // default_head_dim
+  assert model_config["hidden_size"] % model_config["num_heads"] == 0, (
+    f"hidden_size={model_config['hidden_size']} must be divisible by num_heads={model_config['num_heads']}"
+  )
+  assert model_config["hidden_size"] // model_config["num_heads"] == sum(model_config["axes_dim"]), (
+    f"hidden_size/num_heads must equal {sum(model_config['axes_dim'])} to keep Flux positional encoding dimensions aligned"
+  )
+  return model_config
 
 
 def flux_checkpoint_step_interval(global_batch_size:int) -> int:
@@ -200,6 +224,7 @@ __all__ = [
   "FLUX_PACKED_SPATIAL_SIZE", "FLUX_PATCH_SIZE", "FLUX_AUTOENCODER_SCALE", "FLUX_AUTOENCODER_SHIFT",
   "FLUX_QUALITY_TARGET", "FLUX_SINGLE_STREAM_BLOCKS", "FLUX_T5_EMBED_DIM", "FLUX_T5_MAX_TOKENS",
   "FLUX_TRAIN_SAMPLES", "FLUX_VAE_DOWNSCALE_FACTOR", "flux_aggregate_validation_loss",
+  "flux_model_config_from_env",
   "flux_checkpoint_step_interval", "flux_eval_step_interval", "flux_eval_timestep_ids", "flux_eval_timesteps",
   "flux_image_ids", "flux_pack_latents", "flux_rectified_flow_inputs", "flux_rectified_flow_losses", "flux_sample_latents",
   "flux_sample_training_timesteps", "flux_train_loss", "flux_validation_loss",
