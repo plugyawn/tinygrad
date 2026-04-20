@@ -5,10 +5,10 @@ import unittest
 from dataclasses import dataclass
 import math
 import numpy as np
-from tinygrad import Tensor
+from tinygrad import Tensor, dtypes
 from tinygrad.nn.state import get_state_dict
 from extra.models.flux import Flux, FluxParams
-from examples.mlperf.flux import FLUX_FIXED_EVAL_TIMESTEPS, flux_aggregate_validation_loss, flux_eval_timesteps, flux_validation_target_met
+from examples.mlperf.flux import FLUX_FIXED_EVAL_TIMESTEPS, flux_aggregate_validation_loss, flux_eval_timesteps, flux_validation_noises, flux_validation_target_met
 
 try:
   import torch
@@ -304,9 +304,26 @@ class TestFlux(unittest.TestCase):
     self.assertEqual(timesteps.shape, (1,))
     np.testing.assert_allclose(timesteps.numpy(), [3 / 8], atol=0.0, rtol=0.0)
 
+  def test_flux_eval_timesteps_reject_invalid_int_tensor_bucket(self):
+    with self.assertRaisesRegex(ValueError, "out of range"):
+      flux_eval_timesteps(Tensor([8], dtype=dtypes.int32))
+
   def test_flux_aggregate_validation_loss_rejects_invalid_buckets(self):
     with self.assertRaisesRegex(ValueError, "out of range"):
       flux_aggregate_validation_loss(Tensor([1.0]), [-1])
+
+  def test_flux_aggregate_validation_loss_requires_full_bucket_coverage(self):
+    with self.assertRaisesRegex(ValueError, "missing eval timestep buckets"):
+      flux_aggregate_validation_loss(Tensor([1.0]), [0])
+
+  def test_flux_validation_noises_are_deterministic_per_batch(self):
+    latent0, flow0 = flux_validation_noises((2, 3), seed=123, batch_index=4)
+    latent1, flow1 = flux_validation_noises((2, 3), seed=123, batch_index=4)
+    latent2, flow2 = flux_validation_noises((2, 3), seed=123, batch_index=5)
+    np.testing.assert_array_equal(latent0.numpy(), latent1.numpy())
+    np.testing.assert_array_equal(flow0.numpy(), flow1.numpy())
+    self.assertFalse(np.array_equal(latent0.numpy(), latent2.numpy()))
+    self.assertFalse(np.array_equal(flow0.numpy(), flow2.numpy()))
 
   def test_flux_validation_target_met_accepts_tensor(self):
     self.assertTrue(flux_validation_target_met(Tensor([0.5]).reshape(()), target=0.6))

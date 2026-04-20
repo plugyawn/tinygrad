@@ -1638,7 +1638,7 @@ def train_flux():
     FLUX_ADAMW_BETA1, FLUX_ADAMW_BETA2, FLUX_ADAMW_EPS, FLUX_ADAMW_WEIGHT_DECAY, FLUX_CLIP_EMBED_DIM, FLUX_EVAL_SAMPLES,
     FLUX_FIXED_EVAL_TIMESTEPS, FLUX_LR_WARMUP_STEPS, FLUX_QUALITY_TARGET, FLUX_T5_EMBED_DIM, FLUX_T5_MAX_TOKENS,
     FLUX_TRAIN_SAMPLES, flux_aggregate_validation_loss, flux_checkpoint_step_interval, flux_eval_step_interval,
-    flux_model_config_from_env, flux_train_loss, flux_validation_losses, flux_validation_target_met,
+    flux_model_config_from_env, flux_train_loss, flux_validation_losses, flux_validation_noises, flux_validation_target_met,
   )
   from examples.mlperf.initializers import init_flux
 
@@ -1750,13 +1750,13 @@ def train_flux():
     save_ckpt_dir.mkdir(parents=True, exist_ok=True)
     fn = save_ckpt_dir / f"flux_step{step}.safetensors"
     print(f"saving ckpt to {fn}")
-    safe_save(get_training_state(model, optimizer, scheduler), str(fn), metadata=checkpoint_metadata)
+    safe_save(get_training_state(model, optimizer, scheduler), str(fn), metadata=checkpoint_metadata | {"flux_step": step})
 
-  def save_model_checkpoint():
+  def save_model_checkpoint(step:int):
     save_ckpt_dir.mkdir(parents=True, exist_ok=True)
     fn = save_ckpt_dir / "flux.safetensors"
     print(f"saving model to {fn}")
-    safe_save(get_state_dict(model), str(fn), metadata=checkpoint_metadata)
+    safe_save(get_state_dict(model), str(fn), metadata=checkpoint_metadata | {"flux_step": step})
 
   def fake_batch(batch_size:int, include_timestep:bool=False, offset:int=0) -> dict[str, Tensor]:
     batch:dict[str, Tensor] = {
@@ -1782,8 +1782,8 @@ def train_flux():
       yield from batch_load_val_flux_preprocessed(val_dataset, EVAL_BS)
 
   def move_tensor(x:Tensor) -> Tensor:
-    x = x.cast(dtypes.default_float) if dtypes.is_float(x.dtype) else x
-    return x.shard(GPUS, axis=0) if len(GPUS) > 1 else x.to(GPUS[0])
+    x = x.shard(GPUS, axis=0) if len(GPUS) > 1 else x.to(GPUS[0])
+    return x.cast(dtypes.default_float) if dtypes.is_float(x.dtype) and x.dtype != dtypes.default_float else x
 
   def prepare_train_batch(batch:dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     mean, logvar, txt, vec = (move_tensor(batch[k]) for k in ("mean", "logvar", "t5_encodings", "clip_encodings"))
@@ -1816,8 +1816,8 @@ def train_flux():
     return loss, global_norm, optimizer.lr
 
   @TinyJit
-  def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor):
-    losses = flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids)
+  def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor, latent_noise:Tensor, flow_noise:Tensor):
+    losses = flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids, latent_noise=latent_noise, flow_noise=flow_noise)
     losses_cpu = losses.float().to("CPU")
     timestep_ids_cpu = timestep_ids.to("CPU")
     Tensor.realize(losses_cpu, timestep_ids_cpu)
@@ -1835,7 +1835,10 @@ def train_flux():
         if eval_idx == eval_steps: break
         GlobalCounters.reset()
         st = time.perf_counter()
-        loss_batch, timestep_batch = eval_step(*prepare_eval_batch(batch, eval_idx * EVAL_BS))
+        eval_batch = prepare_eval_batch(batch, eval_idx * EVAL_BS)
+        latent_noise, flow_noise = (move_tensor(t) for t in flux_validation_noises(batch["mean"].shape, seed, eval_idx))
+        Tensor.realize(latent_noise, flow_noise)
+        loss_batch, timestep_batch = eval_step(*eval_batch, latent_noise, flow_noise)
         eval_times.append(time.perf_counter() - st)
         losses.extend(loss_batch.numpy().reshape(-1).tolist())
         timestep_ids.extend(map(int, timestep_batch.numpy().reshape(-1).tolist()))
@@ -1845,6 +1848,8 @@ def train_flux():
           return math.inf, True
     if getenv("RESET_STEP", 1): eval_step.reset()
     if not losses: return math.inf, False
+    if RUNMLPERF and len(losses) != FLUX_EVAL_SAMPLES:
+      raise ValueError(f"expected {FLUX_EVAL_SAMPLES} eval losses, got {len(losses)}")
     validation_loss = flux_aggregate_validation_loss(Tensor(losses, dtype=dtypes.float32), Tensor(timestep_ids, dtype=dtypes.int32)).item()
     avg_eval_time = sum(eval_times) / len(eval_times)
     tqdm.write(f"eval step {step}: loss {validation_loss:.5f}, avg eval time {avg_eval_time:.4f}s")
@@ -1901,7 +1906,7 @@ def train_flux():
         if MLLOGGER and RUNMLPERF:
           MLLOGGER.event(key=mllog_constants.TRAIN_SAMPLES, value=samples_seen)
           MLLOGGER.end(key=mllog_constants.RUN_STOP, metadata={mllog_constants.STATUS: mllog_constants.SUCCESS})
-        save_model_checkpoint()
+        save_model_checkpoint(step)
         return last_eval_loss
       if MLLOGGER and RUNMLPERF:
         MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: samples_seen})

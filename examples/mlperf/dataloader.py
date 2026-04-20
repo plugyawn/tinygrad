@@ -555,11 +555,14 @@ def _resolve_flux_preprocessed_dataset_paths(dataset_path:str|Path) -> list[Path
   return resolved
 
 def _deserialize_flux_preprocessed_bf16_array(data:bytes) -> np.ndarray:
-  return np.load(io.BytesIO(data), allow_pickle=False)
+  arr = np.load(io.BytesIO(data), allow_pickle=False)
+  if arr.dtype == np.uint16: return (arr.astype(np.uint32) << 16).view(np.float32)
+  if arr.dtype == np.float32: return arr
+  raise ValueError(f"unsupported Flux preprocessed dtype {arr.dtype}")
 
 def _stack_flux_preprocessed_bf16(batch:list[dict], key:str) -> Tensor:
   return Tensor(np.stack([_deserialize_flux_preprocessed_bf16_array(sample[key]) for sample in batch]),
-                dtype=dtypes.uint16, device="CPU").bitcast(dtypes.bfloat16)
+                dtype=dtypes.float32, device="CPU")
 
 def _collate_flux_preprocessed_batch(batch:list[dict]) -> dict[str, Tensor|list[str]]:
   required_keys = ("__key__", "t5_encodings", "clip_encodings", "mean", "logvar")

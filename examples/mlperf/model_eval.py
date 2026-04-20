@@ -253,8 +253,8 @@ def eval_flux():
   from extra.models.flux import Flux, FluxParams
   from examples.mlperf.dataloader import batch_load_val_flux_preprocessed
   from examples.mlperf.flux import (
-    FLUX_QUALITY_TARGET, flux_aggregate_validation_loss, flux_model_config_from_env,
-    flux_validation_losses, flux_validation_target_met,
+    FLUX_EVAL_SAMPLES, FLUX_QUALITY_TARGET, flux_aggregate_validation_loss, flux_model_config_from_env,
+    flux_validation_losses, flux_validation_noises, flux_validation_target_met,
   )
   from examples.mlperf.initializers import init_flux
 
@@ -266,8 +266,8 @@ def eval_flux():
   RUNMLPERF          = config["RUNMLPERF"]              = getenv("RUNMLPERF")
   LOGMLPERF          = config["LOGMLPERF"]              = getenv("LOGMLPERF")
   BS                 = config["BS"]                     = getenv("BS", 1 * len(GPUS))
-  DATADIR            = config["DATADIR"]                = Path(getenv("DATADIR", "./datasets/flux"))
-  VAL_DATASET        = config["VAL_DATASET"]            = getenv("VAL_DATASET", str(DATADIR / "val-*"))
+  DATADIR            = config["DATADIR"]                = Path(getenv("DATADIR", "./datasets"))
+  VAL_DATASET        = config["VAL_DATASET"]            = getenv("VAL_DATASET", (DATADIR / "coco_preprocessed" / "*").as_posix())
   EVAL_CKPT_DIR      = config["EVAL_CKPT_DIR"]          = getenv("EVAL_CKPT_DIR", "")
   STOP_IF_CONVERGED  = config["STOP_IF_CONVERGED"]      = getenv("STOP_IF_CONVERGED", 0)
   config["MODEL_CONFIG"] = model_config = flux_model_config_from_env()
@@ -290,34 +290,50 @@ def eval_flux():
   assert EVAL_CKPT_DIR != "", "provide a directory with checkpoints to be evaluated"
   print(f"running eval on checkpoints in {EVAL_CKPT_DIR}\nSEED={seed}")
   eval_queue:list[tuple[int, Path]] = []
+  def flux_checkpoint_iteration(ckpt_path:Path) -> int|None:
+    if (match:=re.fullmatch(r"(?:flux_step)?(\d+)\.safetensors", ckpt_path.name)) is not None:
+      return int(match.group(1))
+    if ckpt_path.name != "flux.safetensors": return None
+    _, _, metadata = safe_load_metadata(ckpt_path)
+    saved_step = metadata.get("__metadata__", {}).get("flux_step")
+    if saved_step is None: raise ValueError(f"{ckpt_path.name} is missing flux_step metadata")
+    return int(saved_step)
   for p in Path(EVAL_CKPT_DIR).iterdir():
-    if (match:=re.fullmatch(r"(?:flux_step)?(\d+)\.safetensors", p.name)) is not None:
-      eval_queue.append((int(match.group(1)), p))
-  assert len(eval_queue), f'no Flux step checkpoints matching "flux_step<step>.safetensors" were found in {EVAL_CKPT_DIR}'
+    if (ckpt_iteration:=flux_checkpoint_iteration(p)) is not None:
+      eval_queue.append((ckpt_iteration, p))
+  assert len(eval_queue), f'no Flux checkpoints matching "flux_step<step>.safetensors" or "flux.safetensors" were found in {EVAL_CKPT_DIR}'
   print(sorted(eval_queue))
 
   Tensor.manual_seed(seed)
   model = init_flux(Flux(FluxParams(**model_config)), None, GPUS, strict=True)
 
+  def move_tensor(x:Tensor) -> Tensor:
+    x = x.shard(GPUS, axis=0) if len(GPUS) > 1 else x.to(GPUS[0])
+    return x.cast(dtypes.default_float) if dtypes.is_float(x.dtype) and x.dtype != dtypes.default_float else x
+
   @TinyJit
   def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor, latent_noise:Tensor, flow_noise:Tensor) -> Tensor:
-    for t in (mean, logvar, txt, vec, timestep_ids, latent_noise, flow_noise): t.shard_(GPUS, axis=0)
     return flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids,
                                   latent_noise=latent_noise, flow_noise=flow_noise).to("CPU").realize()
 
   @Tensor.train(mode=False)
   def eval_model() -> float:
     losses, timestep_ids = [], []
-    for batch in tqdm(batch_load_val_flux_preprocessed(VAL_DATASET, BS)):
+    for eval_idx, batch in enumerate(tqdm(batch_load_val_flux_preprocessed(VAL_DATASET, BS))):
       assert "timestep" in batch, "Flux eval expects preprocessed validation samples with timestep bucket ids"
-      mean, logvar = batch["mean"], batch["logvar"]
-      batch_timestep_ids = batch["timestep"].numpy()
-      losses.append(eval_step(mean, logvar, batch["t5_encodings"], batch["clip_encodings"], batch["timestep"],
-                              Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype), Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype)).numpy())
-      timestep_ids.append(batch_timestep_ids)
+      mean, logvar = move_tensor(batch["mean"]), move_tensor(batch["logvar"])
+      txt, vec = move_tensor(batch["t5_encodings"]), move_tensor(batch["clip_encodings"])
+      timestep_tensor = move_tensor(batch["timestep"])
+      latent_noise, flow_noise = (move_tensor(t) for t in flux_validation_noises(batch["mean"].shape, seed, eval_idx))
+      Tensor.realize(mean, logvar, txt, vec, timestep_tensor, latent_noise, flow_noise)
+      losses.append(eval_step(mean, logvar, txt, vec, timestep_tensor, latent_noise, flow_noise).numpy())
+      timestep_ids.append(batch["timestep"].numpy())
     assert losses, f"no validation samples were loaded from {VAL_DATASET}"
-    validation_loss = flux_aggregate_validation_loss(Tensor(np.concatenate(losses), dtype=dtypes.float32, device="CPU"),
-                                                     Tensor(np.concatenate(timestep_ids), dtype=dtypes.int32, device="CPU")).item()
+    losses_np, timestep_ids_np = np.concatenate(losses), np.concatenate(timestep_ids)
+    if RUNMLPERF and len(losses_np) != FLUX_EVAL_SAMPLES:
+      raise ValueError(f"expected {FLUX_EVAL_SAMPLES} eval losses, got {len(losses_np)}")
+    validation_loss = flux_aggregate_validation_loss(Tensor(losses_np, dtype=dtypes.float32, device="CPU"),
+                                                     Tensor(timestep_ids_np, dtype=dtypes.int32, device="CPU")).item()
     return float(validation_loss)
 
   def flux_eval_state_dict(ckpt_path:Path) -> tuple[dict[str, Tensor], dict]:

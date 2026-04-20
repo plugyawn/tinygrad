@@ -1,4 +1,5 @@
 import math
+import numpy as np
 
 from tinygrad import Tensor, dtypes
 from tinygrad.helpers import getenv
@@ -109,7 +110,15 @@ def flux_sample_training_timesteps(batch_size:int, device=None, dtype=dtypes.flo
 
 
 def flux_eval_timestep_ids(timestep_ids:Tensor|int|float|list[int]|list[float]|tuple[int, ...]|tuple[float, ...], device=None) -> Tensor:
-  values = timestep_ids.numpy().reshape(-1).tolist() if isinstance(timestep_ids, Tensor) else timestep_ids
+  if isinstance(timestep_ids, Tensor):
+    if dtypes.is_int(timestep_ids.dtype):
+      from tinygrad.engine.jit import JitError
+      try: values = timestep_ids.to("CPU").numpy().reshape(-1).tolist()
+      except JitError: return timestep_ids.cast(dtypes.int32)
+    else:
+      values = timestep_ids.numpy().reshape(-1).tolist()
+  else:
+    values = timestep_ids
   if isinstance(values, (int, float)): values = [values]
   else: values = list(values)
 
@@ -130,6 +139,12 @@ def flux_eval_timestep_ids(timestep_ids:Tensor|int|float|list[int]|list[float]|t
 def flux_eval_timesteps(timestep_ids:Tensor|int|float|list[int]|list[float]|tuple[int, ...]|tuple[float, ...], device=None,
                         dtype=dtypes.float32) -> Tensor:
   return flux_eval_timestep_ids(timestep_ids, device=device).cast(dtype) / FLUX_EVAL_TIMESTEP_DIVISOR
+
+def flux_validation_noises(shape:tuple[int, ...], seed:int, batch_index:int, device=None, dtype=dtypes.float32) -> tuple[Tensor, Tensor]:
+  latent_seed, flow_seed = seed + batch_index * 2, seed + batch_index * 2 + 1
+  latent_noise = Tensor(np.random.RandomState(latent_seed).standard_normal(size=shape).astype(np.float32), device=device, dtype=dtypes.float32)
+  flow_noise = Tensor(np.random.RandomState(flow_seed).standard_normal(size=shape).astype(np.float32), device=device, dtype=dtypes.float32)
+  return latent_noise.cast(dtype), flow_noise.cast(dtype)
 
 
 def flux_pack_latents(latents:Tensor) -> Tensor:
@@ -198,6 +213,8 @@ def flux_validation_losses(model, mean:Tensor, logvar:Tensor, txt:Tensor, vec:Te
 def flux_aggregate_validation_loss(losses:Tensor, timestep_ids:Tensor|int|float|list[int]|list[float]|tuple[int, ...]|tuple[float, ...]) -> Tensor:
   losses = losses.reshape(-1).cast(dtypes.float32)
   timestep_ids = flux_eval_timestep_ids(timestep_ids, device=losses.device)
+  missing_buckets = sorted(set(range(FLUX_EVAL_TIMESTEP_BUCKETS)).difference(map(int, timestep_ids.to("CPU").numpy().reshape(-1).tolist())))
+  if missing_buckets: raise ValueError(f"missing eval timestep buckets: {missing_buckets}")
   bucket_ids = Tensor.arange(FLUX_EVAL_TIMESTEP_BUCKETS, device=timestep_ids.device, dtype=dtypes.int32).reshape(FLUX_EVAL_TIMESTEP_BUCKETS, 1)
   matches = (bucket_ids == timestep_ids.reshape(1, -1)).cast(dtypes.float32)
   count_per_bucket = matches.sum(axis=1)
@@ -228,5 +245,5 @@ __all__ = [
   "flux_checkpoint_step_interval", "flux_eval_step_interval", "flux_eval_timestep_ids", "flux_eval_timesteps",
   "flux_image_ids", "flux_pack_latents", "flux_rectified_flow_inputs", "flux_rectified_flow_losses", "flux_sample_latents",
   "flux_sample_training_timesteps", "flux_train_loss", "flux_validation_loss",
-  "flux_validation_losses", "flux_validation_target_met", "flux_text_ids",
+  "flux_validation_losses", "flux_validation_noises", "flux_validation_target_met", "flux_text_ids",
 ]

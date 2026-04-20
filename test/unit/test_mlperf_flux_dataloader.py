@@ -57,9 +57,9 @@ class TestMLPerfFluxDataloader(unittest.TestCase):
     self.assertEqual(batch["__key__"], ["sample-0", "sample-1"])
     self.assertEqual(batch["timestep"].dtype, dtypes.int32)
     np.testing.assert_array_equal(batch["timestep"].numpy(), [1, 3])
-    self.assertEqual(batch["t5_encodings"].dtype, dtypes.bfloat16)
-    np.testing.assert_allclose(batch["t5_encodings"].float().numpy(), [[[1.0, 2.0], [3.0, 4.0]], [[11.0, 12.0], [13.0, 14.0]]], atol=0.0, rtol=0.0)
-    np.testing.assert_allclose(batch["clip_encodings"].float().numpy(), [[5.0, 6.0], [15.0, 16.0]], atol=0.0, rtol=0.0)
+    self.assertEqual(batch["t5_encodings"].dtype, dtypes.float32)
+    np.testing.assert_allclose(batch["t5_encodings"].numpy(), [[[1.0, 2.0], [3.0, 4.0]], [[11.0, 12.0], [13.0, 14.0]]], atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(batch["clip_encodings"].numpy(), [[5.0, 6.0], [15.0, 16.0]], atol=0.0, rtol=0.0)
 
   def test_load_flux_empty_encodings(self):
     with tempfile.TemporaryDirectory() as tmpdir:
