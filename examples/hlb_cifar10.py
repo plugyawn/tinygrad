@@ -18,7 +18,7 @@ from extra.bench_log import BenchEvent, WallTimeEvent
 
 NUM_GPUS = getenv("GPUS", 1)
 BS = getenv("BS", 1024)
-EVAL_BS = getenv("EVAL_BS", 2500 if NUM_GPUS == 1 else BS)
+EVAL_BS = getenv("EVAL_BS", 10000 if NUM_GPUS == 1 else BS)
 GPUS = [f'{Device.DEFAULT}:{i}' for i in range(NUM_GPUS)]
 assert BS % len(GPUS) == 0, f"{BS=} is not a multiple of {len(GPUS)=}"
 assert EVAL_BS % len(GPUS) == 0, f"{EVAL_BS=} is not a multiple of {len(GPUS)=}"
@@ -64,6 +64,7 @@ class UnsyncedBatchNorm:
   def __init__(self, sz:int, eps=1e-5, affine=True, track_running_stats=True, momentum=0.1, num_devices=len(GPUS)):
     self.eps, self.track_running_stats, self.momentum = eps, track_running_stats, momentum
     self.num_devices = num_devices
+    self.updates:list[Tensor] = []
 
     if affine: self.weight, self.bias = Tensor.ones(sz, dtype=dtypes.float32), Tensor.zeros(sz, dtype=dtypes.float32)
     else: self.weight, self.bias = None, None
@@ -82,6 +83,7 @@ class UnsyncedBatchNorm:
     return ret.reshape(x.shape).cast(x.dtype)
 
   def calc_stats(self, x:Tensor):
+    self.updates = []
     if Tensor.training:
       # This requires two full memory accesses to x
       # https://github.com/pytorch/pytorch/blob/c618dc13d2aa23625cb0d7ada694137532a4fa33/aten/src/ATen/native/cuda/Normalization.cuh
@@ -93,10 +95,10 @@ class UnsyncedBatchNorm:
 
       # NOTE: wow, this is done all throughout training in most PyTorch models
       if self.track_running_stats:
-        self.running_mean.assign((1-self.momentum) * self.running_mean + self.momentum * batch_mean.detach().cast(self.running_mean.dtype)).realize()
+        self.updates.append(self.running_mean.assign((1-self.momentum) * self.running_mean + self.momentum * batch_mean.detach().cast(self.running_mean.dtype)))
         batch_var_adjust = prod(y.shape[1:])/(prod(y.shape[1:])-y.shape[2])
-        self.running_var.assign((1-self.momentum) * self.running_var + self.momentum * batch_var_adjust * batch_var.detach().cast(self.running_var.dtype)).realize()
-        self.num_batches_tracked.assign(self.num_batches_tracked + 1).realize()
+        self.updates.append(self.running_var.assign((1-self.momentum) * self.running_var + self.momentum * batch_var_adjust * batch_var.detach().cast(self.running_var.dtype)))
+        self.updates.append(self.num_batches_tracked.assign(self.num_batches_tracked + 1))
     else:
       batch_mean = self.running_mean
       # NOTE: this can be precomputed for static inference. we expand it here so it fuses
@@ -183,7 +185,7 @@ def train_cifar():
   artifact_env_keys = {"DEV", "DEFAULT_FLOAT", "GPUS", "BS", "EVAL_BS", "BEAM", "JITBEAM", "WINO", "TC_OPT", "TARGET_EVAL_ACC_PCT",
                        "ASSERT_MAX_WALL_TIME", "ASSERT_MIN_STEP_TIME", "BENCHMARK_LOG", "ARTIFACT_DIR", "RUN_PHASE",
                        "TRAIN_EPOCHS", "STEPS", "EVAL_STEPS", "SEED", "WHITEN_EXAMPLES", "CUTMIX", "RANDOM_CROP", "RANDOM_FLIP",
-                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "DISABLE_BACKWARD"}
+                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "DISABLE_BACKWARD", "LOG_EPOCHS", "LOG_STEPS", "JIT_EVAL", "SYNC_STEPS"}
   artifact_env = {k: os.environ[k] for k in sorted(artifact_env_keys) if k in os.environ}
   artifact_log = open(artifact_path/"run.log", "w", buffering=1) if artifact_path else None
 
@@ -322,7 +324,7 @@ def train_cifar():
     if is_train:
       X, Y = (augmentations_cutmix if do_cutmix and getenv("CUTMIX", 1) else augmentations)(X, Y)
     et = time.monotonic()
-    if getenv("LOG_EPOCHS", 1): log(f"shuffling {'training' if is_train else 'test'} dataset in {(et-st)*1e3:.2f} ms ({epoch=})")
+    if getenv("LOG_EPOCHS", 0): log(f"shuffling {'training' if is_train else 'test'} dataset in {(et-st)*1e3:.2f} ms ({epoch=})")
 
     full_batch_count = X.shape[0] // BS if epoch_fraction >= 1 else round(epoch_fraction * X.shape[0] / BS)
     full_batches = full_batch_count * BS
@@ -345,12 +347,14 @@ def train_cifar():
 
     @TinyJit
     def update(self, net, decay):
+      updates = []
       for net_ema_param, (param_name, net_param) in zip(get_state_dict(self.net_ema).values(), get_state_dict(net).items()):
         if dtypes.is_float(net_param.dtype):
           ema = net_ema_param.detach()*decay + net_param.detach()*(1.-decay)
-          net_ema_param.assign(ema).realize()
+          updates.append(net_ema_param.assign(ema))
           if not (("norm" in param_name and "weight" in param_name) or "whitening" in param_name):
-            net_param.assign(ema.detach()).realize()
+            updates.append(net_param.assign(ema.detach()))
+      Tensor.realize(*updates)
 
   set_seed(getenv('SEED', hyp['seed']))
 
@@ -414,15 +418,14 @@ def train_cifar():
     out = model(X)
     loss_batchsize_scaler = 512/BS
     loss = cross_entropy(out, Y, reduction='none', label_smoothing=hyp['opt']['label_smoothing']).mul(hyp['opt']['loss_scale_scaler']*loss_batchsize_scaler).sum().div(hyp['opt']['loss_scale_scaler'])
+    state_updates = [u for layer in model.net if isinstance(layer, ConvGroup) for norm in (layer.norm1, layer.norm2) for u in getattr(norm, "updates", [])]
 
     if not getenv("DISABLE_BACKWARD"):
       # index 0 for bias and 1 for non-bias
       optimizer.zero_grad()
       loss.backward()
-      optimizer.step()
-      lr_scheduler[0].step()
-      lr_scheduler[1].step()
-    return loss.realize()
+      state_updates += optimizer.schedule_step() + lr_scheduler[0].schedule_step() + lr_scheduler[1].schedule_step()
+    return loss.realize(*state_updates)
 
   train_step_jitted = TinyJit(train_step)
 
@@ -430,9 +433,9 @@ def train_cifar():
     out = model(X, training=False)
     loss = cross_entropy(out, Y, reduction='mean')
     correct = out.argmax(axis=1) == Y.argmax(axis=1)
-    return correct.realize(), loss.realize()
-  eval_step_jitted     = eval_step
-  eval_step_ema_jitted = eval_step
+    return correct.sum().realize(), loss.mul(Y.shape[0]).realize()
+  eval_step_jitted     = TinyJit(eval_step) if getenv("JIT_EVAL", 1) else eval_step
+  eval_step_ema_jitted = TinyJit(eval_step) if getenv("JIT_EVAL", 1) else eval_step
 
   step_times = []
   timing_rows = [] if artifact_path else None
@@ -450,31 +453,36 @@ def train_cifar():
 
   def run_eval(step:int):
     nonlocal eval_time
-    corrects, losses = [], []
-    corrects_ema, losses_ema = [], []
+    correct_sum = correct_len = 0
+    loss_sum = 0.0
+    correct_sum_ema = correct_len_ema = 0
+    loss_sum_ema = 0.0
+    use_jit_eval = getenv("JIT_EVAL", 1) and X_test.shape[0] == EVAL_BS
+    eval_model = eval_step_jitted if use_jit_eval else eval_step
+    eval_ema = eval_step_ema_jitted if use_jit_eval else eval_step
     eval_st = time.monotonic()
     for Xt, Yt in fetch_batches(X_test, Y_test, BS=EVAL_BS, is_train=False):
       if len(GPUS) > 1:
         Xt.shard_(GPUS, axis=0)
         Yt.shard_(GPUS, axis=0)
 
-      with Tensor.train(False): correct, loss = eval_step_jitted(model, Xt, Yt)
-      losses.append(loss.numpy().tolist())
-      corrects.extend(correct.numpy().tolist())
+      with Tensor.train(False): correct, loss = eval_model(model, Xt, Yt)
+      correct_sum += int(correct.numpy().item())
+      correct_len += Yt.shape[0]
+      loss_sum += float(loss.numpy().item())
       if model_ema:
-        with Tensor.train(False): correct_ema, loss_ema = eval_step_ema_jitted(model_ema.net_ema, Xt, Yt)
-        losses_ema.append(loss_ema.numpy().tolist())
-        corrects_ema.extend(correct_ema.numpy().tolist())
+        with Tensor.train(False): correct_ema, loss_ema = eval_ema(model_ema.net_ema, Xt, Yt)
+        correct_sum_ema += int(correct_ema.numpy().item())
+        correct_len_ema += Yt.shape[0]
+        loss_sum_ema += float(loss_ema.numpy().item())
 
-    correct_sum, correct_len = sum(corrects), len(corrects)
     eval_time += time.monotonic() - eval_st
-    acc, loss = correct_sum/correct_len*100.0, sum(losses)/len(losses)
+    acc, loss = correct_sum/correct_len*100.0, loss_sum/correct_len
     log(f"eval     {correct_sum}/{correct_len} {acc:.2f}%, {loss:7.2f} val_loss STEP={step}")
     if accuracy_rows is not None: accuracy_rows.append({"step": step, "split": "eval", "accuracy_pct": acc, "loss": loss})
     if not model_ema: return acc, loss
 
-    correct_sum_ema, correct_len_ema = sum(corrects_ema), len(corrects_ema)
-    acc_ema, loss_ema = correct_sum_ema/correct_len_ema*100.0, sum(losses_ema)/len(losses_ema)
+    acc_ema, loss_ema = correct_sum_ema/correct_len_ema*100.0, loss_sum_ema/correct_len_ema
     log(f"eval ema {correct_sum_ema}/{correct_len_ema} {acc_ema:.2f}%, {loss_ema:7.2f} val_loss STEP={step}")
     if accuracy_rows is not None: accuracy_rows.append({"step": step, "split": "eval_ema", "accuracy_pct": acc_ema, "loss": loss_ema})
     return acc_ema, loss_ema
@@ -505,12 +513,14 @@ def train_cifar():
               model_ema = modelEMA(W, model)
             model_ema.update(model, Tensor([projected_ema_decay_val*((i+1)/steps)**hyp['ema']['decay_pow']]))
 
+          if getenv("SYNC_STEPS", 0):
+            for d in list(Device._opened_devices): Device[d].synchronize()
         cl = time.monotonic()
         step_times.append((cl-st)*1000.0)
         if timing_rows is not None:
           timing_rows.append({"step": i, "epoch": epoch, "wall_ms": (cl-st)*1000.0, "mem_gb": GlobalCounters.mem_used/1e9,
                               "global_ops": GlobalCounters.global_ops, "gflops": GlobalCounters.global_ops*1e-9/(cl-st)})
-        if getenv("LOG_STEPS", 50) and (i % getenv("LOG_STEPS", 50) == 0 or i+1 == steps):
+        if (log_steps:=getenv("LOG_STEPS", 0)) and (i % log_steps == 0 or i+1 == steps):
           loss_cpu = loss.numpy()
           device_str = loss.device if isinstance(loss.device, str) else f"{loss.device[0]} * {len(loss.device)}"
           log(f"{i:3d} {(cl-st)*1000.0:7.2f} ms run, {device_str}, {loss_cpu:7.2f} loss, {opt_non_bias.lr.numpy()[0]:.6f} LR, {GlobalCounters.mem_used/1e9:.2f} GB used, {GlobalCounters.global_ops*1e-9/(cl-st):9.2f} GFLOPS, {GlobalCounters.global_ops*1e-9:9.2f} GOPS")
@@ -519,9 +529,10 @@ def train_cifar():
         if eval_steps and i % eval_steps == 0 and not getenv("DISABLE_BACKWARD"):
           eval_acc_pct, eval_loss = run_eval(i)
 
+    for d in list(Device._opened_devices): Device[d].synchronize()
+    timed_wall = time.monotonic() - timed_st
     if eval_acc_pct == 0.0 and not getenv("DISABLE_BACKWARD"):
       eval_acc_pct, eval_loss = run_eval(i)
-    timed_wall = time.monotonic() - timed_st
     log(f"timed_wall {timed_wall:.3f}s, steps {i}, eval_acc_pct {eval_acc_pct:.2f}, eval_loss {eval_loss:.4f}")
 
   min_step_time = min(step_times) if step_times else None
@@ -559,7 +570,7 @@ def train_cifar():
       "final_accuracy": eval_acc_pct, "wall_time": timed_wall, "run_phase": run_phase,
       "cold_wall_time": timed_wall if run_phase == "cold" else None,
       "warm_wall_time": timed_wall if run_phase == "warm" else None,
-      "train_time": timed_wall - eval_time, "eval_time": eval_time, "best_step_time": min_step_time,
+      "train_time": timed_wall, "eval_time": eval_time, "best_step_time": min_step_time,
       "mean_step_time": sum(step_times)/len(step_times) if step_times else None,
       "kernel_search_settings": {"BEAM": getenv("BEAM", 0), "JITBEAM": getenv("JITBEAM", 0), "WINO": getenv("WINO", 0), "TC_OPT": getenv("TC_OPT", 0)},
       "checks": checks,
