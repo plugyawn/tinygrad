@@ -7,7 +7,8 @@ import csv, json, math, os, random, subprocess, sys, time
 import numpy as np
 from pathlib import Path
 from typing import Optional
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 from extra.lr_scheduler import OneCycleLR
 from tinygrad import nn, dtypes, Tensor, Device, GlobalCounters, TinyJit, Variable
 from tinygrad.nn.state import get_state_dict
@@ -15,9 +16,10 @@ from tinygrad.nn import optim
 from tinygrad.helpers import Context, BEAM, WINO, getenv, colored, prod
 from extra.bench_log import BenchEvent, WallTimeEvent
 
+NUM_GPUS = getenv("GPUS", 1)
 BS = getenv("BS", 1024)
-EVAL_BS = getenv("EVAL_BS", 2500)
-GPUS = [f'{Device.DEFAULT}:{i}' for i in range(getenv("GPUS", 1))]
+EVAL_BS = getenv("EVAL_BS", 2500 if NUM_GPUS == 1 else BS)
+GPUS = [f'{Device.DEFAULT}:{i}' for i in range(NUM_GPUS)]
 assert BS % len(GPUS) == 0, f"{BS=} is not a multiple of {len(GPUS)=}"
 assert EVAL_BS % len(GPUS) == 0, f"{EVAL_BS=} is not a multiple of {len(GPUS)=}"
 if getenv("FUSE_OPTIM", 1): Context(FUSE_OPTIM=1).__enter__()
@@ -178,8 +180,10 @@ def train_cifar():
     artifact_dir = f"artifacts/hlb_cifar10/a100_{time.strftime('%Y%m%d_%H%M%S')}"
   artifact_path = Path(artifact_dir) if artifact_dir else None
   if artifact_path: artifact_path.mkdir(parents=True, exist_ok=True)
-  artifact_env_keys = {"DEV", "DEFAULT_FLOAT", "BS", "EVAL_BS", "BEAM", "JITBEAM", "WINO", "TC_OPT", "TARGET_EVAL_ACC_PCT",
-                       "ASSERT_MAX_WALL_TIME", "ASSERT_MIN_STEP_TIME", "BENCHMARK_LOG", "ARTIFACT_DIR", "RUN_PHASE"}
+  artifact_env_keys = {"DEV", "DEFAULT_FLOAT", "GPUS", "BS", "EVAL_BS", "BEAM", "JITBEAM", "WINO", "TC_OPT", "TARGET_EVAL_ACC_PCT",
+                       "ASSERT_MAX_WALL_TIME", "ASSERT_MIN_STEP_TIME", "BENCHMARK_LOG", "ARTIFACT_DIR", "RUN_PHASE",
+                       "TRAIN_EPOCHS", "STEPS", "EVAL_STEPS", "SEED", "WHITEN_EXAMPLES", "CUTMIX", "RANDOM_CROP", "RANDOM_FLIP",
+                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "DISABLE_BACKWARD"}
   artifact_env = {k: os.environ[k] for k in sorted(artifact_env_keys) if k in os.environ}
   artifact_log = open(artifact_path/"run.log", "w", buffering=1) if artifact_path else None
 
@@ -190,7 +194,7 @@ def train_cifar():
       print(*args, file=artifact_log, **log_kwargs)
 
   def _run(cmd):
-    try: return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
+    try: return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, cwd=REPO_ROOT).strip()
     except Exception as e: return str(e)
 
   def _write_plot(steps, accs):
@@ -477,7 +481,8 @@ def train_cifar():
 
   with Tensor.train():
     timed_st = time.monotonic()
-    for epoch in range(math.ceil(train_epochs)):
+    total_epochs = math.ceil(train_epochs) if steps == default_steps else math.ceil(steps / num_steps_per_epoch)
+    for epoch in range(total_epochs):
       if i >= steps: break
       epoch_fraction = 1 if epoch + 1 < train_epochs else train_epochs % 1
       if steps != default_steps: epoch_fraction = 1

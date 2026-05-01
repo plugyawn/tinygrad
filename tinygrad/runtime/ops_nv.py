@@ -155,7 +155,7 @@ class NVComputeQueue(NVCommandQueue):
       self.active_qmd.write(dependent_qmd0_pointer=qmd_buf.va_addr >> 8, dependent_qmd0_action=1, dependent_qmd0_prefetch=1, dependent_qmd0_enable=1)
 
     self.active_qmd, self.active_qmd_buf = qmd, qmd_buf
-    self.active_qmd_release = prg.dev.iface.compute_class != nv_gpu.AMPERE_COMPUTE_A
+    self.active_qmd_release = qmd.ver >= 3
     return self
 
   def signal(self, signal:HCQSignal, value:sint=0):
