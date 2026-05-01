@@ -325,8 +325,8 @@ def eval_flux():
                               randn_like_batch(mean.shape, mean.dtype)).numpy())
       timestep_ids.append(batch_timestep_ids)
     assert losses, f"no validation samples were loaded from {VAL_DATASET}"
-    validation_loss = flux_aggregate_validation_loss(Tensor(np.concatenate(losses), dtype=dtypes.float32, device="CPU"),
-                                                     Tensor(np.concatenate(timestep_ids), dtype=dtypes.int32, device="CPU")).item()
+    validation_loss = flux_aggregate_validation_loss(Tensor(np.concatenate(losses), dtype=dtypes.float32, device=Device.DEFAULT),
+                                                     Tensor(np.concatenate(timestep_ids), dtype=dtypes.int32, device=Device.DEFAULT)).item()
     return float(validation_loss)
 
   def flux_eval_state_dict(ckpt_path:Path) -> tuple[dict[str, Tensor], dict]:
