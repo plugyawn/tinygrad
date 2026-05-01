@@ -621,8 +621,10 @@ class NVDevice(HCQCompiled[NVSignal]):
       'num_tpc_per_gpc', 'num_sm_per_tpc', 'max_warps_per_sm', 'sm_version')
 
     # FIXME: no idea how to convert this for blackwells
-    self.arch: str = "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
-    self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
+    ampere_a = self.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A
+    self.arch: str = "sm_80" if ampere_a else \
+                     "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
+    self.sass_version = 0x80 if ampere_a else ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
 
     super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], functools.partial(NVProgram, self), NVSignal,
                      NVComputeQueue, NVCopyQueue, arch=self.arch)
