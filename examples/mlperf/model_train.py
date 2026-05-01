@@ -1781,7 +1781,8 @@ def train_flux():
 
   def move_tensor(x:Tensor) -> Tensor:
     x = x.cast(dtypes.default_float) if dtypes.is_float(x.dtype) else x
-    return x.shard(GPUS, axis=0) if len(GPUS) > 1 else x.to(GPUS[0])
+    x = x.shard(GPUS, axis=0) if len(GPUS) > 1 else x.to(GPUS[0])
+    return x.contiguous()
 
   def prepare_train_batch(batch:dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     mean, logvar, txt, vec = (move_tensor(batch[k]) for k in ("mean", "logvar", "t5_encodings", "clip_encodings"))
@@ -1793,6 +1794,7 @@ def train_flux():
     timestep_ids = batch.get("timestep", Tensor([(offset + i) % len(FLUX_FIXED_EVAL_TIMESTEPS) for i in range(batch["mean"].shape[0])],
                                                 dtype=dtypes.int32, device="CPU"))
     timestep_ids = timestep_ids.shard(GPUS, axis=0) if len(GPUS) > 1 else timestep_ids.to(GPUS[0])
+    timestep_ids = timestep_ids.contiguous()
     Tensor.realize(timestep_ids)
     return mean, logvar, txt, vec, timestep_ids
 

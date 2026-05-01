@@ -312,8 +312,9 @@ def eval_flux():
       assert "timestep" in batch, "Flux eval expects preprocessed validation samples with timestep bucket ids"
       mean, logvar = batch["mean"], batch["logvar"]
       batch_timestep_ids = batch["timestep"].numpy()
-      losses.append(eval_step(mean, logvar, batch["t5_encodings"], batch["clip_encodings"], batch["timestep"],
-                              Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype), Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype)).numpy())
+      losses.append(eval_step(mean.contiguous(), logvar.contiguous(), batch["t5_encodings"].contiguous(), batch["clip_encodings"].contiguous(),
+                              batch["timestep"].contiguous(), Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype).contiguous(),
+                              Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype).contiguous()).numpy())
       timestep_ids.append(batch_timestep_ids)
     assert losses, f"no validation samples were loaded from {VAL_DATASET}"
     validation_loss = flux_aggregate_validation_loss(Tensor(np.concatenate(losses), dtype=dtypes.float32, device="CPU"),
