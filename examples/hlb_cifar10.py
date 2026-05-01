@@ -242,13 +242,9 @@ def train_cifar():
       return np.flip(Λ, 0).reshape(-1,1,1,1), np.flip(V.T.reshape(c*h*w, c, h, w), 0)
 
     # NOTE: np.linalg.eigh only supports float32 so the whitening layer weights need to be converted to float16 manually
-    patches = _patches(X_np)
     split_size = getenv("WHITEN_SPLITS", 5000)
-    patches_per_image = (X_np.shape[2]-kernel_size+1) * (X_np.shape[3]-kernel_size+1)
-    split_patches = [patches]
-    if split_size > 0:
-      split_patches = [patches[i:i+split_size*patches_per_image] for i in range(0, patches.shape[0], split_size*patches_per_image)]
-    eigens = [_eigens(p) for p in split_patches if p.shape[0]]
+    split_data = [X_np] if split_size <= 0 else [X_np[i:i+split_size] for i in range(0, X_np.shape[0], split_size)]
+    eigens = [_eigens(_patches(x)) for x in split_data if x.shape[0]]
     Λ = np.stack([x[0] for x in eigens], axis=0).mean(axis=0)
     V = np.stack([x[1] for x in eigens], axis=0).mean(axis=0)
     W = V/np.sqrt(Λ+1e-2)
