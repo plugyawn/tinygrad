@@ -126,21 +126,27 @@ def matmul_conv2d(x:Tensor, conv:nn.Conv2d):
   return ret if conv.bias is None else ret.add(conv.bias.reshape(1, -1, 1, 1))
 
 class ConvGroup:
-  def __init__(self, channels_in, channels_out):
+  def __init__(self, channels_in, channels_out, layer_idx:int):
+    self.layer_idx = layer_idx
     self.conv1 = nn.Conv2d(channels_in,  channels_out, kernel_size=3, padding=1, bias=False)
     self.conv2 = nn.Conv2d(channels_out, channels_out, kernel_size=3, padding=1, bias=False)
 
     self.norm1 = BatchNorm(channels_out)
     self.norm2 = BatchNorm(channels_out)
 
+  def _conv(self, x:Tensor, conv:nn.Conv2d, conv_idx:int):
+    mask = getenv("MATMUL_CONV_MASK", -1)
+    use_matmul = getenv("MATMUL_CONV") if mask < 0 else bool(mask & (1 << conv_idx))
+    return matmul_conv2d(x, conv) if use_matmul else conv(x)
+
   def __call__(self, x):
-    x = matmul_conv2d(x, self.conv1) if getenv("MATMUL_CONV") else self.conv1(x)
+    x = self._conv(x, self.conv1, self.layer_idx*2)
     x = x.max_pool2d(2)
     x = x.float()
     x = self.norm1(x)
     x = x.cast(dtypes.default_float)
     x = x.gelu()
-    x = matmul_conv2d(x, self.conv2) if getenv("MATMUL_CONV") else self.conv2(x)
+    x = self._conv(x, self.conv2, self.layer_idx*2+1)
     x = x.float()
     x = self.norm2(x)
     x = x.cast(dtypes.default_float)
@@ -152,9 +158,9 @@ class SpeedyResNet:
   def __init__(self, W):
     self.whitening = W
     self.net = [
-      ConvGroup(W.shape[0], 64),
-      ConvGroup(64, 256),
-      ConvGroup(256, 512),
+      ConvGroup(W.shape[0], 64, 0),
+      ConvGroup(64, 256, 1),
+      ConvGroup(256, 512, 2),
       lambda x: x.max((2,3)),
       nn.Linear(512, 10, bias=False),
       lambda x: x * hyp['opt']['scaling_factor'],
@@ -197,8 +203,8 @@ def train_cifar():
   artifact_env_keys = {"DEV", "DEFAULT_FLOAT", "GPUS", "BS", "EVAL_BS", "BEAM", "JITBEAM", "WINO", "TC_OPT", "TARGET_EVAL_ACC_PCT",
                        "ASSERT_MAX_WALL_TIME", "ASSERT_MIN_STEP_TIME", "BENCHMARK_LOG", "ARTIFACT_DIR", "RUN_PHASE",
                        "TRAIN_EPOCHS", "STEPS", "EVAL_STEPS", "SEED", "WHITEN_EXAMPLES", "WHITEN_SPLITS", "CUTMIX", "RANDOM_CROP", "RANDOM_FLIP",
-                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "MATMUL_CONV", "MATMUL_CONV_CONTIG", "CONV_ACC_FLOAT",
-                       "DISABLE_BACKWARD", "LOG_EPOCHS", "LOG_STEPS", "JIT_EVAL", "SYNC_STEPS"}
+                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "MATMUL_CONV", "MATMUL_CONV_MASK", "MATMUL_CONV_CONTIG",
+                       "CONV_ACC_FLOAT", "DISABLE_BACKWARD", "LOG_EPOCHS", "LOG_STEPS", "JIT_EVAL", "SYNC_STEPS"}
   artifact_env = {k: os.environ[k] for k in sorted(artifact_env_keys) if k in os.environ}
   artifact_log = open(artifact_path/"run.log", "w", buffering=1) if artifact_path else None
 
