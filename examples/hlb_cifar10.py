@@ -147,9 +147,7 @@ class SpeedyResNet:
     ]
 
   def _forward(self, x):
-    # pad to 32x32 because whitening conv creates 31x31 images that are awfully slow to compute with
-    # TODO: remove the pad but instead let the kernel optimize itself
-    return x.conv2d(self.whitening).gelu().pad((1,0,0,1)).sequential(self.net)
+    return x.conv2d(self.whitening).gelu().sequential(self.net)
 
   def __call__(self, x, training=True):
     if training: return self._forward(x)
@@ -184,7 +182,7 @@ def train_cifar():
   if artifact_path: artifact_path.mkdir(parents=True, exist_ok=True)
   artifact_env_keys = {"DEV", "DEFAULT_FLOAT", "GPUS", "BS", "EVAL_BS", "BEAM", "JITBEAM", "WINO", "TC_OPT", "TARGET_EVAL_ACC_PCT",
                        "ASSERT_MAX_WALL_TIME", "ASSERT_MIN_STEP_TIME", "BENCHMARK_LOG", "ARTIFACT_DIR", "RUN_PHASE",
-                       "TRAIN_EPOCHS", "STEPS", "EVAL_STEPS", "SEED", "WHITEN_EXAMPLES", "CUTMIX", "RANDOM_CROP", "RANDOM_FLIP",
+                       "TRAIN_EPOCHS", "STEPS", "EVAL_STEPS", "SEED", "WHITEN_EXAMPLES", "WHITEN_SPLITS", "CUTMIX", "RANDOM_CROP", "RANDOM_FLIP",
                        "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "DISABLE_BACKWARD", "LOG_EPOCHS", "LOG_STEPS", "JIT_EVAL", "SYNC_STEPS"}
   artifact_env = {k: os.environ[k] for k in sorted(artifact_env_keys) if k in os.environ}
   artifact_log = open(artifact_path/"run.log", "w", buffering=1) if artifact_path else None
@@ -223,9 +221,12 @@ def train_cifar():
 
   # ========== Model ==========
   def whitening(X, kernel_size=hyp['net']['kernel_size']):
-    X = X[:getenv("WHITEN_EXAMPLES", hyp['net']['whitening_examples'])]
+    X_np = X.float().numpy()
+    X_np = X_np[np.random.default_rng(getenv("SEED", hyp['seed'])).permutation(X_np.shape[0])]
+    X_np = X_np[:getenv("WHITEN_EXAMPLES", hyp['net']['whitening_examples'])]
 
     def _cov(X):
+      X = X - X.mean(axis=0, keepdims=True)
       return (X.T @ X) / (X.shape[0] - 1)
 
     def _patches(data, patch_size=(kernel_size,kernel_size)):
@@ -238,11 +239,19 @@ def train_cifar():
       n,c,h,w = patches.shape
       Σ = _cov(patches.reshape(n, c*h*w))
       Λ, V = np.linalg.eigh(Σ, UPLO='U')
-      return np.flip(Λ, 0), np.flip(V.T.reshape(c*h*w, c, h, w), 0)
+      return np.flip(Λ, 0).reshape(-1,1,1,1), np.flip(V.T.reshape(c*h*w, c, h, w), 0)
 
     # NOTE: np.linalg.eigh only supports float32 so the whitening layer weights need to be converted to float16 manually
-    Λ, V = _eigens(_patches(X.float().numpy()))
-    W = V/np.sqrt(Λ+1e-2)[:,None,None,None]
+    patches = _patches(X_np)
+    split_size = getenv("WHITEN_SPLITS", 5000)
+    patches_per_image = (X_np.shape[2]-kernel_size+1) * (X_np.shape[3]-kernel_size+1)
+    split_patches = [patches]
+    if split_size > 0:
+      split_patches = [patches[i:i+split_size*patches_per_image] for i in range(0, patches.shape[0], split_size*patches_per_image)]
+    eigens = [_eigens(p) for p in split_patches if p.shape[0]]
+    Λ = np.stack([x[0] for x in eigens], axis=0).mean(axis=0)
+    V = np.stack([x[1] for x in eigens], axis=0).mean(axis=0)
+    W = V/np.sqrt(Λ+1e-2)
     W = np.concatenate((W, -W), axis=0)
 
     return Tensor(W.astype(np.float32), requires_grad=False).cast(dtypes.default_float)
@@ -511,7 +520,8 @@ def train_cifar():
           if epoch >= ema_epoch_start and (i+1) % hyp['ema']['every_n_steps'] == 0:
             if model_ema is None:
               model_ema = modelEMA(W, model)
-            model_ema.update(model, Tensor([projected_ema_decay_val*((i+1)/steps)**hyp['ema']['decay_pow']]))
+            else:
+              model_ema.update(model, Tensor([projected_ema_decay_val*((i+1)/steps)**hyp['ema']['decay_pow']]))
 
           if getenv("SYNC_STEPS", 0):
             for d in list(Device._opened_devices): Device[d].synchronize()
