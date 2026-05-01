@@ -284,6 +284,9 @@ def train_cifar():
     full_batch_count = X.shape[0] // BS if epoch_fraction >= 1 else round(epoch_fraction * X.shape[0] / BS)
     full_batches = full_batch_count * BS
     if full_batches == 0: return
+    if not is_train:
+      for i in range(0, full_batches, BS): yield X[i:i+BS], Y[i:i+BS]
+      return
     vi = Variable("i", 0, full_batches - BS)
     for i in range(0, full_batches, BS):
       vib = vi.bind(i)
