@@ -7,6 +7,7 @@ import csv, json, math, os, random, subprocess, sys, time
 import numpy as np
 from pathlib import Path
 from typing import Optional
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 from extra.lr_scheduler import OneCycleLR
 from tinygrad import nn, dtypes, Tensor, Device, GlobalCounters, TinyJit, Variable
 from tinygrad.nn.state import get_state_dict
