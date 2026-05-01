@@ -111,6 +111,17 @@ class BatchNorm(nn.BatchNorm2d if getenv("SYNCBN") else UnsyncedBatchNorm):
     self.weight.requires_grad = False
     self.bias.requires_grad = True
 
+def matmul_conv2d(x:Tensor, conv:nn.Conv2d):
+  assert conv.groups == 1 and conv.stride == 1 and conv.dilation == 1, "matmul_conv2d only supports dense stride-1 convs"
+  bs, cin = x.shape[:2]
+  cout, _, kh, kw = conv.weight.shape
+  x = x.pad(x._resolve_pool_pads(conv.padding, 2))._pool((kh, kw), 1, 1)
+  oy, ox = x.shape[2:4]
+  x = x.permute(0, 2, 3, 1, 4, 5).reshape(bs*oy*ox, cin*kh*kw)
+  ret = x.matmul(conv.weight.reshape(cout, cin*kh*kw).transpose(), dtype=dtypes.float32 if getenv("CONV_ACC_FLOAT") else None)
+  ret = ret.reshape(bs, oy, ox, cout).permute(0, 3, 1, 2).cast(dtypes.default_float)
+  return ret if conv.bias is None else ret.add(conv.bias.reshape(1, -1, 1, 1))
+
 class ConvGroup:
   def __init__(self, channels_in, channels_out):
     self.conv1 = nn.Conv2d(channels_in,  channels_out, kernel_size=3, padding=1, bias=False)
@@ -120,13 +131,13 @@ class ConvGroup:
     self.norm2 = BatchNorm(channels_out)
 
   def __call__(self, x):
-    x = self.conv1(x)
+    x = matmul_conv2d(x, self.conv1) if getenv("MATMUL_CONV") else self.conv1(x)
     x = x.max_pool2d(2)
     x = x.float()
     x = self.norm1(x)
     x = x.cast(dtypes.default_float)
     x = x.gelu()
-    x = self.conv2(x)
+    x = matmul_conv2d(x, self.conv2) if getenv("MATMUL_CONV") else self.conv2(x)
     x = x.float()
     x = self.norm2(x)
     x = x.cast(dtypes.default_float)
@@ -183,7 +194,8 @@ def train_cifar():
   artifact_env_keys = {"DEV", "DEFAULT_FLOAT", "GPUS", "BS", "EVAL_BS", "BEAM", "JITBEAM", "WINO", "TC_OPT", "TARGET_EVAL_ACC_PCT",
                        "ASSERT_MAX_WALL_TIME", "ASSERT_MIN_STEP_TIME", "BENCHMARK_LOG", "ARTIFACT_DIR", "RUN_PHASE",
                        "TRAIN_EPOCHS", "STEPS", "EVAL_STEPS", "SEED", "WHITEN_EXAMPLES", "WHITEN_SPLITS", "CUTMIX", "RANDOM_CROP", "RANDOM_FLIP",
-                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "DISABLE_BACKWARD", "LOG_EPOCHS", "LOG_STEPS", "JIT_EVAL", "SYNC_STEPS"}
+                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "MATMUL_CONV", "CONV_ACC_FLOAT", "DISABLE_BACKWARD", "LOG_EPOCHS",
+                       "LOG_STEPS", "JIT_EVAL", "SYNC_STEPS"}
   artifact_env = {k: os.environ[k] for k in sorted(artifact_env_keys) if k in os.environ}
   artifact_log = open(artifact_path/"run.log", "w", buffering=1) if artifact_path else None
 
