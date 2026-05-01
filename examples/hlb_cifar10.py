@@ -89,10 +89,10 @@ class UnsyncedBatchNorm:
 
       # NOTE: wow, this is done all throughout training in most PyTorch models
       if self.track_running_stats:
-        self.running_mean.assign((1-self.momentum) * self.running_mean + self.momentum * batch_mean.detach().cast(self.running_mean.dtype))
+        self.running_mean.assign((1-self.momentum) * self.running_mean + self.momentum * batch_mean.detach().cast(self.running_mean.dtype)).realize()
         batch_var_adjust = prod(y.shape[1:])/(prod(y.shape[1:])-y.shape[2])
-        self.running_var.assign((1-self.momentum) * self.running_var + self.momentum * batch_var_adjust * batch_var.detach().cast(self.running_var.dtype))
-        self.num_batches_tracked += 1
+        self.running_var.assign((1-self.momentum) * self.running_var + self.momentum * batch_var_adjust * batch_var.detach().cast(self.running_var.dtype)).realize()
+        self.num_batches_tracked.assign(self.num_batches_tracked + 1).realize()
     else:
       batch_mean = self.running_mean
       # NOTE: this can be precomputed for static inference. we expand it here so it fuses
