@@ -299,9 +299,13 @@ def eval_flux():
   Tensor.manual_seed(seed)
   model = init_flux(Flux(FluxParams(**model_config)), None, GPUS, strict=True)
 
+  def move_tensor(x:Tensor) -> Tensor:
+    x = x.cast(dtypes.default_float) if dtypes.is_float(x.dtype) else x
+    x = x.shard(GPUS, axis=0) if len(GPUS) > 1 else x.to(GPUS[0])
+    return x.contiguous()
+
   @TinyJit
   def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor, latent_noise:Tensor, flow_noise:Tensor) -> Tensor:
-    for t in (mean, logvar, txt, vec, timestep_ids, latent_noise, flow_noise): t.shard_(GPUS, axis=0)
     return flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids,
                                   latent_noise=latent_noise, flow_noise=flow_noise).to("CPU").realize()
 
@@ -312,9 +316,9 @@ def eval_flux():
       assert "timestep" in batch, "Flux eval expects preprocessed validation samples with timestep bucket ids"
       mean, logvar = batch["mean"], batch["logvar"]
       batch_timestep_ids = batch["timestep"].numpy()
-      losses.append(eval_step(mean.contiguous(), logvar.contiguous(), batch["t5_encodings"].contiguous(), batch["clip_encodings"].contiguous(),
-                              batch["timestep"].contiguous(), Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype).contiguous(),
-                              Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype).contiguous()).numpy())
+      losses.append(eval_step(move_tensor(mean), move_tensor(logvar), move_tensor(batch["t5_encodings"]), move_tensor(batch["clip_encodings"]),
+                              move_tensor(batch["timestep"]), move_tensor(Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype)),
+                              move_tensor(Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype))).numpy())
       timestep_ids.append(batch_timestep_ids)
     assert losses, f"no validation samples were loaded from {VAL_DATASET}"
     validation_loss = flux_aggregate_validation_loss(Tensor(np.concatenate(losses), dtype=dtypes.float32, device="CPU"),
