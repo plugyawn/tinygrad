@@ -531,7 +531,7 @@ def train_cifar():
 
     for d in list(Device._opened_devices): Device[d].synchronize()
     timed_wall = time.monotonic() - timed_st
-    if eval_acc_pct == 0.0 and not getenv("DISABLE_BACKWARD"):
+    if eval_steps and eval_acc_pct == 0.0 and not getenv("DISABLE_BACKWARD"):
       eval_acc_pct, eval_loss = run_eval(i)
     log(f"timed_wall {timed_wall:.3f}s, steps {i}, eval_acc_pct {eval_acc_pct:.2f}, eval_loss {eval_loss:.4f}")
 
