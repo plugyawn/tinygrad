@@ -304,6 +304,10 @@ def eval_flux():
     x = x.shard(GPUS, axis=0) if len(GPUS) > 1 else x.to(GPUS[0])
     return x.contiguous()
 
+  def randn_like_batch(shape, dtype) -> Tensor:
+    if len(GPUS) == 1: return Tensor.randn(*shape, device=GPUS[0], dtype=dtype).contiguous()
+    return move_tensor(Tensor.randn(*shape, device="CPU", dtype=dtype))
+
   @TinyJit
   def eval_step(mean:Tensor, logvar:Tensor, txt:Tensor, vec:Tensor, timestep_ids:Tensor, latent_noise:Tensor, flow_noise:Tensor) -> Tensor:
     return flux_validation_losses(model, mean, logvar, txt, vec, timestep_ids,
@@ -317,8 +321,8 @@ def eval_flux():
       mean, logvar = batch["mean"], batch["logvar"]
       batch_timestep_ids = batch["timestep"].numpy()
       losses.append(eval_step(move_tensor(mean), move_tensor(logvar), move_tensor(batch["t5_encodings"]), move_tensor(batch["clip_encodings"]),
-                              move_tensor(batch["timestep"]), move_tensor(Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype)),
-                              move_tensor(Tensor.randn(*mean.shape, device="CPU", dtype=mean.dtype))).numpy())
+                              move_tensor(batch["timestep"]), randn_like_batch(mean.shape, mean.dtype),
+                              randn_like_batch(mean.shape, mean.dtype)).numpy())
       timestep_ids.append(batch_timestep_ids)
     assert losses, f"no validation samples were loaded from {VAL_DATASET}"
     validation_loss = flux_aggregate_validation_loss(Tensor(np.concatenate(losses), dtype=dtypes.float32, device="CPU"),
