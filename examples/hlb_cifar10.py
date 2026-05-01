@@ -388,8 +388,8 @@ def train_cifar():
     loss = cross_entropy(out, Y, reduction='mean')
     correct = out.argmax(axis=1) == Y.argmax(axis=1)
     return correct.realize(), loss.realize()
-  eval_step_jitted     = TinyJit(eval_step)
-  eval_step_ema_jitted = TinyJit(eval_step)
+  eval_step_jitted     = eval_step
+  eval_step_ema_jitted = eval_step
 
   step_times = []
   model_ema: Optional[modelEMA] = None
