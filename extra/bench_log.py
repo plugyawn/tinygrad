@@ -6,9 +6,9 @@ from tinygrad.helpers import DEBUG, ContextVar, getenv, GlobalCounters
 
 BENCHMARK_LOG = ContextVar("BENCHMARK_LOG", "")
 
-if BENCHMARK_LOG:
-  from influxdb_client_3 import InfluxDBClient3, Point, WriteOptions, write_client_options
-  from influxdb_client_3.write_client.client.write_api import WriteType
+INFLUXDB_HOST = getenv("INFLUXDB_HOST", "")
+INFLUXDB_ORG = getenv("INFLUXDB_ORG", "tiny")
+INFLUXDB_TOKEN = getenv("INFLUXDB_TOKEN", "")
 
 class BenchEvent(Enum):
   LOAD_WEIGHTS = "load_weights"
@@ -53,12 +53,9 @@ class KernelTimeEvent:
 def log_event_instant(event:InstantBenchEvent, value:float):
   _events[event].append(value)
 
-if BENCHMARK_LOG:
-  INFLUXDB_HOST = getenv("INFLUXDB_HOST", "")
-  INFLUXDB_ORG = getenv("INFLUXDB_ORG", "tiny")
-  INFLUXDB_TOKEN = getenv("INFLUXDB_TOKEN", "")
-
+if BENCHMARK_LOG and INFLUXDB_HOST and INFLUXDB_TOKEN:
   def _create_point(run_id, i, attempt, ref, commit, name, value, run):
+    from influxdb_client_3 import Point
     point = Point(BENCHMARK_LOG.value).tag("id", run_id).tag("index", i)
     point = point.tag("device", Device.DEFAULT)
     point = point.tag("attempt", attempt).tag("ref", ref).tag("commit", commit)
@@ -67,6 +64,8 @@ if BENCHMARK_LOG:
 
   @atexit.register
   def write_events():
+    from influxdb_client_3 import InfluxDBClient3, WriteOptions, write_client_options
+    from influxdb_client_3.write_client.client.write_api import WriteType
     # see if there are any events to write
     have_events = False
     for event in _events:

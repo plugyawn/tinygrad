@@ -3,8 +3,9 @@
 # tinygrad implementation of https://github.com/tysam-code/hlb-CIFAR10/blob/main/main.py
 # https://myrtle.ai/learn/how-to-train-your-resnet-8-bag-of-tricks/
 # https://siboehm.com/articles/22/CUDA-MMM
-import math, random, time
+import csv, json, math, os, random, subprocess, sys, time
 import numpy as np
+from pathlib import Path
 from typing import Optional
 from extra.lr_scheduler import OneCycleLR
 from tinygrad import nn, dtypes, Tensor, Device, GlobalCounters, TinyJit, Variable
@@ -171,6 +172,43 @@ def init_hlb_weights(model:SpeedyResNet):
     _assign_weight(layer.conv2.weight, _dirac_like(layer.conv2.weight.float().numpy()))
 
 def train_cifar():
+  artifact_dir = getenv("ARTIFACT_DIR", "")
+  if not artifact_dir and getenv("BENCHMARK_LOG", ""):
+    artifact_dir = f"artifacts/hlb_cifar10/a100_{time.strftime('%Y%m%d_%H%M%S')}"
+  artifact_path = Path(artifact_dir) if artifact_dir else None
+  if artifact_path: artifact_path.mkdir(parents=True, exist_ok=True)
+  artifact_env_keys = {"DEV", "DEFAULT_FLOAT", "BS", "EVAL_BS", "BEAM", "JITBEAM", "WINO", "TC_OPT", "TARGET_EVAL_ACC_PCT",
+                       "ASSERT_MAX_WALL_TIME", "ASSERT_MIN_STEP_TIME", "BENCHMARK_LOG", "ARTIFACT_DIR", "RUN_PHASE"}
+  artifact_env = {k: os.environ[k] for k in sorted(artifact_env_keys) if k in os.environ}
+  artifact_log = open(artifact_path/"run.log", "w", buffering=1) if artifact_path else None
+
+  def log(*args, **kwargs):
+    print(*args, **kwargs)
+    if artifact_log is not None:
+      log_kwargs = {k:v for k,v in kwargs.items() if k in {"sep", "end", "flush"}}
+      print(*args, file=artifact_log, **log_kwargs)
+
+  def _run(cmd):
+    try: return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
+    except Exception as e: return str(e)
+
+  def _write_plot(steps, accs):
+    if artifact_path is None: return
+    try:
+      from PIL import Image, ImageDraw
+      img = Image.new("RGB", (900, 520), "white")
+      draw = ImageDraw.Draw(img)
+      pad = 54
+      draw.rectangle((pad, pad, 850, 460), outline="black")
+      def line(vals, color, lo, hi):
+        pts = [(pad + i*796/max(1, len(vals)-1), 460 - (v-lo)*406/max(1e-12, hi-lo)) for i,v in enumerate(vals)]
+        if len(pts) > 1: draw.line(pts, fill=color, width=2)
+      if steps: line(steps, "blue", 0, max(steps))
+      if accs: line(accs, "green", 0, 100)
+      draw.text((pad, 20), "blue: step wall ms, green: eval acc pct", fill="black")
+      img.save(artifact_path/"loss_acc_time.png")
+    except Exception as e:
+      (artifact_path/"loss_acc_time.png.err").write_text(str(e))
 
   def set_seed(seed):
     Tensor.manual_seed(seed)
@@ -279,7 +317,7 @@ def train_cifar():
     if is_train:
       X, Y = (augmentations_cutmix if do_cutmix and getenv("CUTMIX", 1) else augmentations)(X, Y)
     et = time.monotonic()
-    if getenv("LOG_EPOCHS", 1): print(f"shuffling {'training' if is_train else 'test'} dataset in {(et-st)*1e3:.2f} ms ({epoch=})")
+    if getenv("LOG_EPOCHS", 1): log(f"shuffling {'training' if is_train else 'test'} dataset in {(et-st)*1e3:.2f} ms ({epoch=})")
 
     full_batch_count = X.shape[0] // BS if epoch_fraction >= 1 else round(epoch_fraction * X.shape[0] / BS)
     full_batches = full_batch_count * BS
@@ -392,19 +430,24 @@ def train_cifar():
   eval_step_ema_jitted = eval_step
 
   step_times = []
+  timing_rows = [] if artifact_path else None
+  accuracy_rows = [] if artifact_path else None
   model_ema: Optional[modelEMA] = None
   projected_ema_decay_val = hyp['ema']['decay_base'] ** hyp['ema']['every_n_steps']
   i = 0
   eval_acc_pct = 0.0
   eval_loss = 0.0
   timed_wall = 0.0
+  eval_time = 0.0
   ema_epoch_start = math.floor(train_epochs) - hyp['ema']['epochs']
   cutmix_epoch_start = train_epochs - hyp['net']['cutmix_epochs']
   eval_steps = getenv("EVAL_STEPS", steps)
 
   def run_eval(step:int):
+    nonlocal eval_time
     corrects, losses = [], []
     corrects_ema, losses_ema = [], []
+    eval_st = time.monotonic()
     for Xt, Yt in fetch_batches(X_test, Y_test, BS=EVAL_BS, is_train=False):
       if len(GPUS) > 1:
         Xt.shard_(GPUS, axis=0)
@@ -419,13 +462,16 @@ def train_cifar():
         corrects_ema.extend(correct_ema.numpy().tolist())
 
     correct_sum, correct_len = sum(corrects), len(corrects)
+    eval_time += time.monotonic() - eval_st
     acc, loss = correct_sum/correct_len*100.0, sum(losses)/len(losses)
-    print(f"eval     {correct_sum}/{correct_len} {acc:.2f}%, {loss:7.2f} val_loss STEP={step}")
+    log(f"eval     {correct_sum}/{correct_len} {acc:.2f}%, {loss:7.2f} val_loss STEP={step}")
+    if accuracy_rows is not None: accuracy_rows.append({"step": step, "split": "eval", "accuracy_pct": acc, "loss": loss})
     if not model_ema: return acc, loss
 
     correct_sum_ema, correct_len_ema = sum(corrects_ema), len(corrects_ema)
     acc_ema, loss_ema = correct_sum_ema/correct_len_ema*100.0, sum(losses_ema)/len(losses_ema)
-    print(f"eval ema {correct_sum_ema}/{correct_len_ema} {acc_ema:.2f}%, {loss_ema:7.2f} val_loss STEP={step}")
+    log(f"eval ema {correct_sum_ema}/{correct_len_ema} {acc_ema:.2f}%, {loss_ema:7.2f} val_loss STEP={step}")
+    if accuracy_rows is not None: accuracy_rows.append({"step": step, "split": "eval_ema", "accuracy_pct": acc_ema, "loss": loss_ema})
     return acc_ema, loss_ema
 
   with Tensor.train():
@@ -455,10 +501,13 @@ def train_cifar():
 
         cl = time.monotonic()
         step_times.append((cl-st)*1000.0)
+        if timing_rows is not None:
+          timing_rows.append({"step": i, "epoch": epoch, "wall_ms": (cl-st)*1000.0, "mem_gb": GlobalCounters.mem_used/1e9,
+                              "global_ops": GlobalCounters.global_ops, "gflops": GlobalCounters.global_ops*1e-9/(cl-st)})
         if getenv("LOG_STEPS", 50) and (i % getenv("LOG_STEPS", 50) == 0 or i+1 == steps):
           loss_cpu = loss.numpy()
           device_str = loss.device if isinstance(loss.device, str) else f"{loss.device[0]} * {len(loss.device)}"
-          print(f"{i:3d} {(cl-st)*1000.0:7.2f} ms run, {device_str}, {loss_cpu:7.2f} loss, {opt_non_bias.lr.numpy()[0]:.6f} LR, {GlobalCounters.mem_used/1e9:.2f} GB used, {GlobalCounters.global_ops*1e-9/(cl-st):9.2f} GFLOPS, {GlobalCounters.global_ops*1e-9:9.2f} GOPS")
+          log(f"{i:3d} {(cl-st)*1000.0:7.2f} ms run, {device_str}, {loss_cpu:7.2f} loss, {opt_non_bias.lr.numpy()[0]:.6f} LR, {GlobalCounters.mem_used/1e9:.2f} GB used, {GlobalCounters.global_ops*1e-9/(cl-st):9.2f} GFLOPS, {GlobalCounters.global_ops*1e-9:9.2f} GOPS")
         i += 1
 
         if eval_steps and i % eval_steps == 0 and not getenv("DISABLE_BACKWARD"):
@@ -467,21 +516,66 @@ def train_cifar():
     if eval_acc_pct == 0.0 and not getenv("DISABLE_BACKWARD"):
       eval_acc_pct, eval_loss = run_eval(i)
     timed_wall = time.monotonic() - timed_st
-    print(f"timed_wall {timed_wall:.3f}s, steps {i}, eval_acc_pct {eval_acc_pct:.2f}, eval_loss {eval_loss:.4f}")
+    log(f"timed_wall {timed_wall:.3f}s, steps {i}, eval_acc_pct {eval_acc_pct:.2f}, eval_loss {eval_loss:.4f}")
 
-  if (assert_time:=getenv("ASSERT_MIN_STEP_TIME")):
-    min_time = min(step_times)
-    assert min_time < assert_time, f"Speed regression, expected min step time of < {assert_time} ms but took: {min_time} ms"
+  min_step_time = min(step_times) if step_times else None
+  assert_time = getenv("ASSERT_MIN_STEP_TIME", 0.0)
+  assert_wall = getenv("ASSERT_MAX_WALL_TIME", 0.0)
+  target = getenv("TARGET_EVAL_ACC_PCT", 0.0)
+  checks = {
+    "min_step_time_ms": {"target": assert_time, "actual": min_step_time, "passed": (not assert_time) or (min_step_time is not None and min_step_time < assert_time)},
+    "max_wall_time_s": {"target": assert_wall, "actual": timed_wall, "passed": (not assert_wall) or timed_wall < assert_wall},
+    "target_eval_acc_pct": {"target": target, "actual": eval_acc_pct, "passed": (not target) or eval_acc_pct >= target},
+  }
 
-  if (assert_wall:=getenv("ASSERT_MAX_WALL_TIME", 0.0)):
-    assert timed_wall < assert_wall, f"Speed regression, expected wall time of < {assert_wall} s but took: {timed_wall:.3f} s"
+  if artifact_path:
+    assert timing_rows is not None and accuracy_rows is not None
+    with open(artifact_path/"timings.csv", "w", newline="") as f:
+      w = csv.DictWriter(f, fieldnames=["step", "epoch", "wall_ms", "mem_gb", "global_ops", "gflops"])
+      w.writeheader()
+      w.writerows(timing_rows)
+    with open(artifact_path/"accuracy.csv", "w", newline="") as f:
+      w = csv.DictWriter(f, fieldnames=["step", "split", "accuracy_pct", "loss"])
+      w.writeheader()
+      w.writerows(accuracy_rows)
+    (artifact_path/"env.txt").write_text("\n".join(f"{k}={v}" for k,v in artifact_env.items())+"\n")
+    (artifact_path/"git.txt").write_text(_run(["git", "rev-parse", "HEAD"])+"\n"+_run(["git", "status", "--short"])+"\n")
+    (artifact_path/"nvidia-smi.txt").write_text(_run(["nvidia-smi"])+"\n")
+    gpu_model = Device.DEFAULT
+    if "NV" in Device.DEFAULT or "CUDA" in Device.DEFAULT:
+      gpu_model = (gpu_lines[0] if (gpu_lines:=_run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]).splitlines()) else Device.DEFAULT)
+    run_phase = getenv("RUN_PHASE", "single")
+    summary = {
+      "git_commit": _run(["git", "rev-parse", "HEAD"]),
+      "gpu_model": gpu_model,
+      "command": " ".join(sys.argv),
+      "env_vars": artifact_env,
+      "final_accuracy": eval_acc_pct, "wall_time": timed_wall, "run_phase": run_phase,
+      "cold_wall_time": timed_wall if run_phase == "cold" else None,
+      "warm_wall_time": timed_wall if run_phase == "warm" else None,
+      "train_time": timed_wall - eval_time, "eval_time": eval_time, "best_step_time": min_step_time,
+      "mean_step_time": sum(step_times)/len(step_times) if step_times else None,
+      "kernel_search_settings": {"BEAM": getenv("BEAM", 0), "JITBEAM": getenv("JITBEAM", 0), "WINO": getenv("WINO", 0), "TC_OPT": getenv("TC_OPT", 0)},
+      "checks": checks,
+    }
+    (artifact_path/"summary.json").write_text(json.dumps(summary, indent=2)+"\n")
+    _write_plot([r["wall_ms"] for r in timing_rows], [r["accuracy_pct"] for r in accuracy_rows])
 
-  # verify eval acc
-  if target := getenv("TARGET_EVAL_ACC_PCT", 0.0):
+  failures = []
+  if assert_time and not checks["min_step_time_ms"]["passed"]:
+    failures.append(f"Speed regression, expected min step time of < {assert_time} ms but took: {min_step_time} ms")
+  if assert_wall and not checks["max_wall_time_s"]["passed"]:
+    failures.append(f"Speed regression, expected wall time of < {assert_wall} s but took: {timed_wall:.3f} s")
+
+  if target:
     if eval_acc_pct >= target:
-      print(colored(f"{eval_acc_pct=} >= {target}", "green"))
+      log(colored(f"{eval_acc_pct=} >= {target}", "green"))
     else:
-      raise ValueError(colored(f"{eval_acc_pct=} < {target}", "red"))
+      failures.append(colored(f"{eval_acc_pct=} < {target}", "red"))
+
+  for failure in failures: log(failure)
+  if artifact_log is not None: artifact_log.close()
+  if failures: raise AssertionError("; ".join(failures))
 
 if __name__ == "__main__":
   with WallTimeEvent(BenchEvent.FULL):
