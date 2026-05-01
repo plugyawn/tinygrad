@@ -118,7 +118,10 @@ def matmul_conv2d(x:Tensor, conv:nn.Conv2d):
   x = x.pad(x._resolve_pool_pads(conv.padding, 2))._pool((kh, kw), 1, 1)
   oy, ox = x.shape[2:4]
   x = x.permute(0, 2, 3, 1, 4, 5).reshape(bs*oy*ox, cin*kh*kw)
-  ret = x.matmul(conv.weight.reshape(cout, cin*kh*kw).transpose(), dtype=dtypes.float32 if getenv("CONV_ACC_FLOAT") else None)
+  w = conv.weight.reshape(cout, cin*kh*kw).transpose()
+  if getenv("MATMUL_CONV_CONTIG"):
+    x, w = x.contiguous(), w.contiguous()
+  ret = x.matmul(w, dtype=dtypes.float32 if getenv("CONV_ACC_FLOAT") else None)
   ret = ret.reshape(bs, oy, ox, cout).permute(0, 3, 1, 2).cast(dtypes.default_float)
   return ret if conv.bias is None else ret.add(conv.bias.reshape(1, -1, 1, 1))
 
@@ -194,8 +197,8 @@ def train_cifar():
   artifact_env_keys = {"DEV", "DEFAULT_FLOAT", "GPUS", "BS", "EVAL_BS", "BEAM", "JITBEAM", "WINO", "TC_OPT", "TARGET_EVAL_ACC_PCT",
                        "ASSERT_MAX_WALL_TIME", "ASSERT_MIN_STEP_TIME", "BENCHMARK_LOG", "ARTIFACT_DIR", "RUN_PHASE",
                        "TRAIN_EPOCHS", "STEPS", "EVAL_STEPS", "SEED", "WHITEN_EXAMPLES", "WHITEN_SPLITS", "CUTMIX", "RANDOM_CROP", "RANDOM_FLIP",
-                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "MATMUL_CONV", "CONV_ACC_FLOAT", "DISABLE_BACKWARD", "LOG_EPOCHS",
-                       "LOG_STEPS", "JIT_EVAL", "SYNC_STEPS"}
+                       "SYNCBN", "FUSE_OPTIM", "LATEBEAM", "LATEWINO", "MATMUL_CONV", "MATMUL_CONV_CONTIG", "CONV_ACC_FLOAT",
+                       "DISABLE_BACKWARD", "LOG_EPOCHS", "LOG_STEPS", "JIT_EVAL", "SYNC_STEPS"}
   artifact_env = {k: os.environ[k] for k in sorted(artifact_env_keys) if k in os.environ}
   artifact_log = open(artifact_path/"run.log", "w", buffering=1) if artifact_path else None
 
