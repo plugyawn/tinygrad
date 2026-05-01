@@ -45,10 +45,11 @@ class QMD:
   fields: dict[str, dict[str, tuple[int, int]]] = {}
 
   def __init__(self, dev:NVDevice, view:MMIOInterface|None=None, **kwargs):
-    self.ver, self.sz = (5, 0x60) if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A else (3, 0x40)
+    self.ver, self.sz = (5, 0x60) if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A else \
+                        ((2, 0x40) if dev.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A else (3, 0x40))
 
     # Init fields from module
-    if (pref:="NVCEC0_QMDV05_00" if self.ver == 5 else "NVC6C0_QMDV03_00") not in QMD.fields:
+    if (pref:="NVCEC0_QMDV05_00" if self.ver == 5 else "NVC6C0_QMDV02_04" if self.ver == 2 else "NVC6C0_QMDV03_00") not in QMD.fields:
       QMD.fields[pref] = {**{name[len(pref)+1:]: dt for name,dt in nv_gpu.__dict__.items() if name.startswith(pref) and isinstance(dt, tuple)},
         **{name[len(pref)+1:]+f"_{i}": dt(i) for name,dt in nv_gpu.__dict__.items() for i in range(8) if name.startswith(pref) and callable(dt)}}
 
@@ -154,10 +155,11 @@ class NVComputeQueue(NVCommandQueue):
       self.active_qmd.write(dependent_qmd0_pointer=qmd_buf.va_addr >> 8, dependent_qmd0_action=1, dependent_qmd0_prefetch=1, dependent_qmd0_enable=1)
 
     self.active_qmd, self.active_qmd_buf = qmd, qmd_buf
+    self.active_qmd_release = prg.dev.iface.compute_class != nv_gpu.AMPERE_COMPUTE_A
     return self
 
   def signal(self, signal:HCQSignal, value:sint=0):
-    if self.active_qmd is not None:
+    if self.active_qmd is not None and self.active_qmd_release:
       for i in range(2):
         if self.active_qmd.read(f'release{i}_enable') == 0:
           self.active_qmd.write(**{f'release{i}_enable': 1})
@@ -294,7 +296,9 @@ class NVProgram(HCQProgram):
         'shader_local_memory_high_size_shifted4':self.lcmem_usage>>4 if NAK else self.dev.slm_per_thread>>4}
     else:
       if not NAK: self.cbuf_0[6:12] = [*data64_le(self.dev.shared_mem_window), *data64_le(self.dev.local_mem_window), *data64_le(0xfffdc0)]
-      qmd = {'qmd_major_version':3, 'sm_global_caching_enable':1, 'program_address_upper':hi32(prog_addr), 'program_address_lower':lo32(prog_addr),
+      ampere_a = dev.iface.compute_class == nv_gpu.AMPERE_COMPUTE_A
+      qmd = {'qmd_major_version':2 if ampere_a else 3, **({'qmd_version':4} if ampere_a else {}), 'sm_global_caching_enable':1,
+        'program_address_upper':hi32(prog_addr), 'program_address_lower':lo32(prog_addr),
         'shared_memory_size':self.shmem_usage, 'register_count_v':self.regs_usage,
         **({'shader_local_memory_low_size':self.lcmem_usage} if NAK else {'shader_local_memory_high_size':self.dev.slm_per_thread})}
 
@@ -302,7 +306,8 @@ class NVProgram(HCQProgram):
 
     self.qmd:QMD = QMD(dev, **qmd, qmd_group_id=0x3f, invalidate_texture_header_cache=1, invalidate_texture_sampler_cache=1,
       invalidate_texture_data_cache=1, invalidate_shader_data_cache=1, api_visible_call_limit=1, sampler_index=1, barrier_count=1,
-      cwd_membar_type=nv_gpu.NVC6C0_QMDV03_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR, constant_buffer_invalidate_0=1, min_sm_config_shared_mem_size=smem_cfg,
+      cwd_membar_type=nv_gpu.NVC6C0_QMDV03_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR, constant_buffer_invalidate_0=1,
+      min_sm_config_shared_mem_size=smem_cfg,
       target_sm_config_shared_mem_size=smem_cfg, max_sm_config_shared_mem_size=0x1a, program_prefetch_size=min(prog_sz>>8, 0x1ff),
       sass_version=dev.sass_version, program_prefetch_addr_upper_shifted=prog_addr>>40, program_prefetch_addr_lower_shifted=prog_addr>>8)
 
